@@ -57,6 +57,8 @@ class NpuQwen3DecoderLayerImpl : public NpuBaseLayer {
 
   virtual int64_t init_layer() override;
 
+  void merge_and_move_pinned_host();
+
   torch::Tensor forward(std::vector<torch::Tensor>& x,
                         std::vector<torch::Tensor>& cos_pos,
                         std::vector<torch::Tensor>& sin_pos,
@@ -69,6 +71,7 @@ class NpuQwen3DecoderLayerImpl : public NpuBaseLayer {
                         int node_id = 0);
 
  private:
+  void merge_loaded_at_weights();
   void param_from_args(atb_speed::qwen::QwenLayerParam& param,
                        const ModelArgs& args,
                        const ParallelArgs& parallel_args,

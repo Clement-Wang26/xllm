@@ -35,6 +35,9 @@ limitations under the License.
 #include "core/layers/lm_head.h"
 #include "core/layers/pos_embedding.h"
 #include "core/layers/rms_norm.h"
+#include "core/util/blocking_counter.h"
+#include "core/util/threadpool.h"
+#include "models/lazy_layer_loader.h"
 #include "models/model_registry.h"
 #if defined(USE_NPU)
 #include "xllm_kernels/core/include/atb_speed/log.h"
@@ -96,7 +99,6 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
                                 int node_id,
                                 std::vector<aclrtEvent*> event,
                                 std::vector<std::atomic<bool>*> event_flag) {
-#if defined(USE_NPU)
     auto micro_batch_num = x.size();
     for (auto i = 0; i < micro_batch_num; ++i) {
       if (input_params[i].src_block_indices.numel() > 0) {
@@ -108,7 +110,6 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
                     0);
       }
     }
-#endif
     return decoder_layer_(x,
                           cos_pos,
                           sin_pos,
@@ -123,12 +124,12 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
   virtual void verify_loaded_weights(const std::string& prefix) const {
     decoder_layer_->verify_loaded_weights();
   }
+
   virtual void merge_loaded_weights() {
     decoder_layer_->merge_loaded_weights();
-#if defined(USE_NPU)
     block_copy_->merge_loaded_weights();
-#endif
   }
+
 #elif defined(USE_MLU)
   virtual torch::Tensor forward(torch::Tensor& x,
                                 torch::Tensor& positions,
@@ -161,6 +162,7 @@ class LlmModelImplBase : public torch::nn::Module {
       this->layer_forward_interrupted_ = interrupted;
     });
     mrope_section_ = args.rope_scaling_mrope_section();
+    aclrtGetDevice(&device_id_);
   }
 
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
@@ -294,7 +296,6 @@ class LlmModelImplBase : public torch::nn::Module {
         VLOG(1) << "Forward interrupted at layer: " << i;
         return torch::Tensor();
       }
-
       layer(hs,
             cos_poss,
             sin_poss,
@@ -328,11 +329,13 @@ class LlmModelImplBase : public torch::nn::Module {
       embed_tokens_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("embed_tokens."));
     }
+
     // call each layer's load_state_dict function
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("layers." + std::to_string(i) + "."));
     }
+
     norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
   }
 
@@ -395,6 +398,7 @@ class LlmModelImplBase : public torch::nn::Module {
 
  private:
   std::string model_type_;
+  int32_t device_id_;
 };
 
 template <typename LlmModelType>

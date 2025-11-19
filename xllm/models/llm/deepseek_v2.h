@@ -320,17 +320,19 @@ class DeepseekV2ForCausalLMImpl : public torch::nn::Module {
   }
 
   void load_model(std::unique_ptr<ModelLoader> loader) {
+    LOG(INFO) << "wy load dict begin";
     for (const auto& state_dict : loader->get_state_dicts()) {
       model_->load_state_dict(state_dict->get_dict_with_prefix("model."));
       lm_head_->load_state_dict(state_dict->get_dict_with_prefix("lm_head."));
     }
-
+    LOG(INFO) << "wy load dict finished";
     // verify
     model_->verify_loaded_weights("model.");
     lm_head_->verify_loaded_weights("lm_head.");
-
+    LOG(INFO) << "wy merge dict begin";
     model_->merge_loaded_weights();
     lm_head_->merge_loaded_weights();
+    LOG(INFO) << "wy merge dict end";
   }
 
   void prepare_expert_weight(int32_t layer_id,

@@ -35,6 +35,7 @@ limitations under the License.
 #include "core/layers/lm_head.h"
 #include "core/layers/pos_embedding.h"
 #include "core/layers/rms_norm.h"
+#include "models/lazy_layer_loader.h"
 #include "models/model_registry.h"
 #if defined(USE_NPU)
 #include "xllm_kernels/core/include/atb_speed/log.h"
@@ -96,7 +97,6 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
                                 int node_id,
                                 std::vector<aclrtEvent*> event,
                                 std::vector<std::atomic<bool>*> event_flag) {
-#if defined(USE_NPU)
     auto micro_batch_num = x.size();
     for (auto i = 0; i < micro_batch_num; ++i) {
       if (input_params[i].src_block_indices.numel() > 0) {
@@ -108,7 +108,6 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
                     0);
       }
     }
-#endif
     return decoder_layer_(x,
                           cos_pos,
                           sin_pos,
@@ -123,12 +122,20 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
   virtual void verify_loaded_weights(const std::string& prefix) const {
     decoder_layer_->verify_loaded_weights();
   }
-  virtual void merge_loaded_weights() {
-    decoder_layer_->merge_loaded_weights();
-#if defined(USE_NPU)
+
+  virtual void merge_loaded_weights(bool lazy_mode = false) {
+    if (!lazy_mode) {
+      decoder_layer_->merge_loaded_weights();
+    } else {
+      decoder_layer_->merge_and_move_pinned_host();
+    }
     block_copy_->merge_loaded_weights();
-#endif
   }
+
+  virtual void move_device_and_init_layer() {
+    decoder_layer_->move_device_and_init_layer();
+  }
+
 #elif defined(USE_MLU)
   virtual torch::Tensor forward(torch::Tensor& x,
                                 torch::Tensor& positions,
@@ -161,6 +168,9 @@ class LlmModelImplBase : public torch::nn::Module {
       this->layer_forward_interrupted_ = interrupted;
     });
     mrope_section_ = args.rope_scaling_mrope_section();
+    aclrtGetDevice(&device_id_);
+    lazy_loader_ =
+        std::make_unique<LazyLayerLoader>(args.n_layers(), device_id_);
   }
 
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
@@ -189,6 +199,11 @@ class LlmModelImplBase : public torch::nn::Module {
     attn_masks.reserve(micro_batch_num);
     std::vector<ModelInputParams>& input_params_news =
         const_cast<std::vector<ModelInputParams>&>(input_params);
+
+    if (!lazy_loader_->is_started()) {
+      lazy_loader_->start_async_loading(
+          [this](int32_t layer_idx) { this->lazy_loaded_layer(layer_idx); });
+    }
 
     for (auto i = 0; i < micro_batch_num; ++i) {
       if (tokens[i].numel() == 0) {
@@ -294,7 +309,7 @@ class LlmModelImplBase : public torch::nn::Module {
         VLOG(1) << "Forward interrupted at layer: " << i;
         return torch::Tensor();
       }
-
+      lazy_loader_->wait_for_layer(i);
       layer(hs,
             cos_poss,
             sin_poss,
@@ -328,15 +343,21 @@ class LlmModelImplBase : public torch::nn::Module {
       embed_tokens_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("embed_tokens."));
     }
+
     // call each layer's load_state_dict function
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->load_state_dict(
           state_dict.get_dict_with_prefix("layers." + std::to_string(i) + "."));
     }
+
     norm_->load_state_dict(state_dict.get_dict_with_prefix("norm."));
   }
 
 #if defined(USE_NPU)
+  virtual void lazy_loaded_layer(int32_t layer_idx) {
+    layers_[layer_idx]->move_device_and_init_layer();
+  }
+
   virtual void verify_loaded_weights(const std::string& prefix) const {
     for (auto i = 0; i < FLAGS_micro_batch_num; i++) {
       embed_tokens_[i]->verify_loaded_weights(prefix + "embed_tokens.");
@@ -353,7 +374,7 @@ class LlmModelImplBase : public torch::nn::Module {
       embed_tokens_[i]->merge_loaded_weights();
     }
     for (int i = 0; i < layers_.size(); i++) {
-      layers_[i]->merge_loaded_weights();
+      layers_[i]->merge_loaded_weights(true);
     }
     norm_->merge_loaded_weights();
   }
@@ -394,7 +415,9 @@ class LlmModelImplBase : public torch::nn::Module {
   bool layer_forward_interrupted_ = false;
 
  private:
+  std::unique_ptr<LazyLayerLoader> lazy_loader_;
   std::string model_type_;
+  int32_t device_id_;
 };
 
 template <typename LlmModelType>
@@ -456,7 +479,8 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
 
   void load_model(std::unique_ptr<ModelLoader> loader,
                   std::string prefix = "model." /*llm model weight prefix*/) {
-    for (const auto& state_dict : loader->get_state_dicts()) {
+    loader_ = std::move(loader);
+    for (const auto& state_dict : loader_->get_state_dicts()) {
       model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
       if (tie_word_embeddings) {
         lm_head_->load_state_dict(
@@ -502,6 +526,7 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   bool tie_word_embeddings{false};
   // test
   layer::LmHead lm_head_{nullptr};
+  std::unique_ptr<ModelLoader> loader_;
 };
 
 }  // namespace xllm

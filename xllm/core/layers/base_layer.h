@@ -27,11 +27,9 @@ limitations under the License.
 #include <string>
 #include <vector>
 
-#include "framework/kv_cache/kv_cache.h"
-#include "framework/model/model_input_params.h"
-#include "framework/model_context.h"
-#include "framework/state_dict/state_dict.h"
-
+#if defined(USE_NPU)
+#include "npu/loader/base_loader.h"
+#endif
 namespace xllm {
 namespace layer {
 
@@ -92,13 +90,43 @@ class BaseLayer : public torch::nn::Module {
 
   virtual ~BaseLayer() {};
 
-  virtual void load_state_dict(const StateDict& state_dict) {};
+  virtual void load_state_dict(const StateDict& state_dict) {
+#if defined(USE_NPU)
+    if (loader_) {
+      loader_->load_state_dict(state_dict);
+    }
+#endif
+  };
 
-  virtual void verify_loaded_weights() const {};
+  virtual void verify_loaded_weights() const {
+#if defined(USE_NPU)
+    if (loader_) {
+      loader_->verify_loaded_weights();
+    }
+#endif
+  };
 
-  virtual void merge_loaded_weights() {};
+  virtual void verify_loaded_weights(const std::string& prefix) const {
+#if defined(USE_NPU)
+    if (loader_) {
+      loader_->verify_loaded_weights(prefix);
+    }
+#endif
+  };
+
+  virtual void merge_loaded_weights() {
+#if defined(USE_NPU)
+    if (loader_) {
+      loader_->merge_loaded_weights();
+    }
+    init_layer();
+#endif
+  };
 
   virtual int64_t init_layer() { return 0; };
+
+  virtual void run_task(std::string taskName, std::function<int()> task) const {
+  };
 
   void set_weight(const StateDict& state_dict,
                   const std::string& tensor_name,
@@ -116,9 +144,6 @@ class BaseLayer : public torch::nn::Module {
                   int rank,
                   int world_size);
 
-  virtual void run_task(std::string taskName, std::function<int()> task) const {
-  };
-
   torch::Dtype string2dtype(const std::string& dtype_str);
 
   void correct_tensor_dtype(torch::Tensor& tensor,
@@ -126,6 +151,9 @@ class BaseLayer : public torch::nn::Module {
 
  protected:
   std::vector<at::Tensor> at_weight_tensors_;
+#if defined(USE_NPU)
+  std::unique_ptr<BaseLoader> loader_ = nullptr;
+#endif
   at::Device device_;
   std::string name_;
   torch::ScalarType dtype_;

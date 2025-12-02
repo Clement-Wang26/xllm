@@ -30,29 +30,33 @@ NpuRmsNormImpl::NpuRmsNormImpl(const ModelContext& context)
     : NpuBaseLayer(context) {
   param_from_args(norm_param_, context.get_model_args());
 
-  at_weight_tensors_.resize(1);
+  // at_weight_tensors_.resize(1);
   atb_weight_tensors_.resize(1);
+  loader_ = std::make_unique<RMSNORMLoader>((uint64_t)1,  // 1 weight
+                                            context);
 
-  auto options = context.get_tensor_options();
-  dtype_ = c10::typeMetaToScalarType(options.dtype());
-  at_weight_tensors_[0] = torch::zeros({1}).to(options);
+  // auto options = context.get_tensor_options();
+  // dtype_ = c10::typeMetaToScalarType(options.dtype());
+  // at_weight_tensors_[0] = torch::zeros({1}).to(options);
 }
 
-void NpuRmsNormImpl::verify_loaded_weights(const std::string weight_str) const {
-  CHECK(at_weight_tensors_[0].sizes() != std::vector<int64_t>({1}))
-      << "final norm weight is not loaded for " << weight_str;
-}
+// void NpuRmsNormImpl::verify_loaded_weights(const std::string weight_str)
+// const {
+//   CHECK(at_weight_tensors_[0].sizes() != std::vector<int64_t>({1}))
+//       << "final norm weight is not loaded for " << weight_str;
+// }
 
 void NpuRmsNormImpl::merge_loaded_weights() {
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
   atb_weight_tensors_[0] =
-      atb_speed::Utils::AtTensor2Tensor(at_weight_tensors_[0]);
+      atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[0]);
   init_layer();
 }
 
-void NpuRmsNormImpl::load_state_dict(const StateDict& state_dict) {
-  set_weight(state_dict, "weight", 0);
-  at_weight_tensors_[0] = at_weight_tensors_[0].to(dtype_);
-}
+// void NpuRmsNormImpl::load_state_dict(const StateDict& state_dict) {
+//   set_weight(state_dict, "weight", 0);
+//   at_weight_tensors_[0] = at_weight_tensors_[0].to(dtype_);
+// }
 
 int64_t NpuRmsNormImpl::init_layer() {
   name_ = "rms_norm_layer";

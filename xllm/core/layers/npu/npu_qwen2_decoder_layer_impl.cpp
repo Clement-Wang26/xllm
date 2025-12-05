@@ -96,8 +96,8 @@ NpuQwen2DecoderLayerImpl::NpuQwen2DecoderLayerImpl(const ModelContext& context)
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(
       torch::zeros({1}).to(device_).to(dtype_));
   at_placeholder_ = torch::zeros({1}).to(device_).to(dtype_);
-  loader_ =
-      std::make_unique<Qwen2DecoderLoader>(WEIGHT_COUNT_PER_LAYER, context);
+  loader_ = std::make_unique<Qwen2DecoderManualLoader>(WEIGHT_COUNT_PER_LAYER,
+                                                       context);
   initialize_quantization_parameters();
 }
 

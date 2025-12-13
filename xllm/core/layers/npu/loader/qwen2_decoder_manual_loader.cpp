@@ -196,19 +196,6 @@ void Qwen2DecoderManualLoader::load_state_dict(const StateDict& state_dict) {
   }
 }
 
-void Qwen2DecoderManualLoader::merge_loaded_weights() {
-  merge_host_at_weights();
-  init_weight_slices();
-  copy_weights_to_device();
-  init_device_at_weights();
-}
-
-void Qwen2DecoderManualLoader::merge_and_move_pinned_host() {
-  merge_host_at_weights();
-  init_weight_slices();
-  copy_weights_to_pinned_host();
-}
-
 void Qwen2DecoderManualLoader::merge_host_at_weights() {
   auto make_zero_like = [](const torch::Tensor& ref) {
     return torch::zeros(

@@ -37,6 +37,20 @@ BaseManualLoader::~BaseManualLoader() {
   release_device_storage();
 }
 
+void BaseManualLoader::merge_loaded_weights() {
+  merge_host_at_weights();
+  init_weight_slices();
+  copy_weights_to_device();
+  init_device_at_weights();
+}
+
+void BaseManualLoader::merge_and_move_pinned_host() {
+  merge_host_at_weights();
+  init_weight_slices();
+  copy_weights_to_pinned_host();
+  init_device_at_weights();
+}
+
 void BaseManualLoader::init_weight_slices() {
   weight_slices_.resize(weight_count_);
   size_t offset = 0;

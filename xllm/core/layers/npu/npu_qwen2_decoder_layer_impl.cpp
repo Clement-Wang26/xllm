@@ -175,6 +175,18 @@ void Qwen2DecoderLayerImpl::initialize_linear_transpose_type() {
   decode_param_.linearTransposeType[4] = transpose_value;
 }
 
+void Qwen2DecoderLayerImpl::merge_and_move_pinned_host() {
+  initialize_linear_transpose_type();
+  loader_->merge_and_move_pinned_host();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
 void Qwen2DecoderLayerImpl::merge_loaded_weights() {
   initialize_linear_transpose_type();
   loader_->merge_loaded_weights();

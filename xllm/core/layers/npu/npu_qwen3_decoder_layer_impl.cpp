@@ -173,6 +173,18 @@ void Qwen3DecoderLayerImpl::merge_loaded_weights() {
   init_layer();
 }
 
+void Qwen3DecoderLayerImpl::merge_and_move_pinned_host() {
+  loader_->merge_and_move_pinned_host();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  c10_npu::NPUCachingAllocator::emptyCache();
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+
+  init_layer();
+}
+
 int64_t Qwen3DecoderLayerImpl::init_layer() {
   init_attn_mask();
   name_ = "qwen3_decoder_layer";

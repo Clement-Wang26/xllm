@@ -141,6 +141,8 @@ class BaseLayer : public torch::nn::Module {
     init_layer();
   };
 
+  virtual void merge_and_move_pinned_host() {};
+
   virtual int64_t init_layer() { return 0; };
 
   virtual void run_task(std::string taskName, std::function<int()> task) const;

@@ -36,6 +36,10 @@ class BaseManualLoader : public BaseLoader {
 
   virtual void init_weight_slices();
 
+  virtual void merge_and_move_pinned_host() override;
+
+  virtual void merge_loaded_weights() override;
+
  protected:
   struct WeightSlice {
     uint64_t offset = 0;
@@ -50,6 +54,7 @@ class BaseManualLoader : public BaseLoader {
   static constexpr size_t kDeviceAlignment = 64;
   static constexpr size_t kHostAlignment = 64;
 
+  virtual void merge_host_at_weights() = 0;
   void release_device_storage();
   void release_host_storage();
   torch::Tensor convert_to_torch_tensor(const std::vector<int64_t>& dims,

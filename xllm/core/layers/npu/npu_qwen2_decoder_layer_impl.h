@@ -50,6 +50,8 @@ class Qwen2DecoderLayerImpl : public BaseLayer {
 
   ~Qwen2DecoderLayerImpl() {};
 
+  virtual void merge_and_move_pinned_host() override;
+
   virtual void merge_loaded_weights() override;
 
   virtual int64_t init_layer() override;

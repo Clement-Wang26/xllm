@@ -33,6 +33,7 @@ limitations under the License.
 #include "core/layers/npu/npu_block_copy_impl.h"
 #include "core/layers/npu/npu_rms_norm_impl.h"
 #include "core/layers/pos_embedding.h"
+#include "loader/lazy_weights_loader.h"
 #include "models/model_registry.h"
 #include "xllm_kernels/core/include/atb_speed/log.h"
 
@@ -90,6 +91,11 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
     decoder_layer_->load_state_dict(state_dict);
   }
 
+  virtual void merge_and_move_pinned_host() {
+    decoder_layer_->merge_and_move_pinned_host();
+    block_copy_->merge_loaded_weights();
+  }
+
  private:
   DecoderType decoder_layer_{nullptr};
   layer::BlockCopy block_copy_{nullptr};
@@ -105,6 +111,10 @@ class LlmModelImplBase : public torch::nn::Module {
       this->layer_forward_interrupted_ = interrupted;
     });
     mrope_section_ = args.rope_scaling_mrope_section();
+    int32_t device_id;
+    aclrtGetDevice(&device_id);
+    lazy_loader_ =
+        std::make_unique<LazyWeightsLoader>(args.n_layers(), device_id);
   }
 
   torch::Tensor get_input_embeddings(torch::Tensor input_ids) {
@@ -255,6 +265,17 @@ class LlmModelImplBase : public torch::nn::Module {
     for (int i = 0; i < layers_.size(); i++) {
       layers_[i]->merge_loaded_weights();
     }
+    lazy_loader_->set_loaded_to_device(true);
+    norm_->merge_loaded_weights();
+  }
+
+  virtual void merge_and_move_pinned_host() {
+    // todo: word embed and norm need to be merged and moved to pinned host.
+    embed_tokens_->merge_loaded_weights();
+    auto load_func = [this](int layer_idx) {
+      layers_[layer_idx]->merge_and_move_pinned_host();
+    };
+    lazy_loader_->load_weights_to_host(load_func);
     norm_->merge_loaded_weights();
   }
 
@@ -287,6 +308,7 @@ class LlmModelImplBase : public torch::nn::Module {
   bool layer_forward_interrupted_ = false;
 
  private:
+  std::unique_ptr<LazyWeightsLoader> lazy_loader_{nullptr};
   std::string model_type_;
 };
 
@@ -343,6 +365,27 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     lm_head_->verify_loaded_weights("lm_head.");
 
     model_->merge_loaded_weights();
+    // test
+    lm_head_->merge_loaded_weights();
+  }
+
+  virtual void lazy_load_model(
+      std::unique_ptr<ModelLoader> loader,
+      std::string prefix = "model." /*llm model weight prefix*/) {
+    for (const auto& state_dict : loader->get_state_dicts()) {
+      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
+      if (tie_word_embeddings) {
+        lm_head_->load_state_dict(
+            state_dict->get_dict_with_prefix(prefix + "embed_tokens."));
+      } else {
+        lm_head_->load_state_dict(state_dict->get_dict_with_prefix("lm_head."));
+      }
+    }
+    // verify
+    model_->verify_loaded_weights(prefix);
+    lm_head_->verify_loaded_weights("lm_head.");
+
+    model_->merge_and_move_pinned_host();
     // test
     lm_head_->merge_loaded_weights();
   }

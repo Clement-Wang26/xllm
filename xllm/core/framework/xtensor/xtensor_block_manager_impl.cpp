@@ -32,16 +32,18 @@ XTensorBlockManagerImpl::XTensorBlockManagerImpl(const Options& options,
                                                  int64_t num_layers,
                                                  size_t block_mem_size,
                                                  size_t page_size,
-                                                 int32_t dp_rank)
+                                                 int32_t dp_rank,
+                                                 const std::string& model_id)
     : BlockManager(options),
+      model_id_(model_id),
       dp_rank_(dp_rank),
       num_layers_(num_layers),
       page_size_(page_size),
       block_mem_size_(block_mem_size),
       num_avail_blocks_(0) {
   LOG(INFO) << "XTensorBlockManagerImpl initialized: "
-            << "dp_rank=" << dp_rank_ << ", num_layers=" << num_layers_
-            << ", page_size=" << page_size_
+            << "model_id=" << model_id_ << ", dp_rank=" << dp_rank_
+            << ", num_layers=" << num_layers_ << ", page_size=" << page_size_
             << ", block_size=" << options.block_size()
             << ", block_mem_size=" << block_mem_size_
             << ", num_blocks=" << options.num_blocks();
@@ -71,7 +73,8 @@ XTensorBlockManagerImpl::~XTensorBlockManagerImpl() {
   full_pages_.clear();
 
   if (!page_ids.empty() && PageAllocator::get_instance().is_initialized()) {
-    PageAllocator::get_instance().free_kv_cache_pages(dp_rank_, page_ids);
+    PageAllocator::get_instance().free_kv_cache_pages(
+        model_id_, dp_rank_, page_ids);
   }
 }
 
@@ -107,8 +110,8 @@ std::vector<int32_t> XTensorBlockManagerImpl::alloc_internal(size_t need_size) {
 
     if (avail_pages_.empty()) {
       // Allocate a new page for this DP group
-      auto new_page =
-          PageAllocator::get_instance().alloc_kv_cache_page(dp_rank_);
+      auto new_page = PageAllocator::get_instance().alloc_kv_cache_page(
+          model_id_, dp_rank_);
       if (new_page == nullptr) {
         LOG(ERROR) << "Failed to allocate new page for dp_rank=" << dp_rank_;
         // Return what we have allocated so far (caller should handle partial
@@ -325,7 +328,8 @@ size_t XTensorBlockManagerImpl::available_size_internal() const {
   // require physical memory mapping which may fail if GPU memory is
   // insufficient.
   auto& page_allocator = PageAllocator::get_instance();
-  size_t reserved_pages = page_allocator.get_num_reserved_virt_pages(dp_rank_);
+  size_t reserved_pages =
+      page_allocator.get_num_reserved_virt_pages(model_id_, dp_rank_);
   size_t blocks_from_reserved_pages =
       reserved_pages * VirtPage::get_num_blocks(page_size_, block_mem_size_);
 
@@ -372,15 +376,16 @@ void XTensorBlockManagerImpl::free_reserved() {
 
 void XTensorBlockManagerImpl::trim() {
   std::lock_guard<std::mutex> lock(mtx_);
-  PageAllocator::get_instance().trim_kv_cache(dp_rank_);
+  PageAllocator::get_instance().trim_kv_cache(model_id_, dp_rank_);
 }
 
 size_t XTensorBlockManagerImpl::get_mapped_memory_size() const {
   auto& page_allocator = PageAllocator::get_instance();
   // Each virtual page uses phy_pages_per_virt_page physical pages
   // Each physical page is phy_page_size bytes
-  return page_allocator.get_num_inuse_virt_pages(dp_rank_) *
-         page_allocator.phy_pages_per_virt_page() * page_allocator.page_size();
+  return page_allocator.get_num_inuse_virt_pages(model_id_, dp_rank_) *
+         page_allocator.phy_pages_per_virt_page(model_id_) *
+         page_allocator.page_size();
 }
 
 size_t XTensorBlockManagerImpl::get_num_allocated_blocks() const {

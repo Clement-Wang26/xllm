@@ -20,8 +20,6 @@ namespace layer {
 
 RMSNormLoader::RMSNormLoader(uint64_t weight_count, const ModelContext& context)
     : BaseLoader(weight_count, context) {
-  at_weight_tensors_.resize(1);
-
   auto options = context.get_tensor_options();
   dtype_ = torch::typeMetaToScalarType(options.dtype());
   at_weight_tensors_[0] = torch::zeros({1}).to(options);

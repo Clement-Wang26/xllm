@@ -42,20 +42,13 @@ static inline VirPtr alloc_virtual_mem(size_t size) {
 XTensor::XTensor(size_t size,
                  torch::Dtype dtype,
                  torch::Device dev,
-                 PhyPage* zero_page,
-                 size_t page_size)
+                 PhyPage* zero_page)
     : vaddr_(0),
       size_(0),
-      page_size_(page_size > 0 ? page_size : FLAGS_phy_page_granularity_size),
-      phy_page_size_(FLAGS_phy_page_granularity_size),
+      page_size_(FLAGS_phy_page_granularity_size),
       dtype_(dtype),
       dev_(dev),
       zero_page_(zero_page) {
-  // Logical page_size_ must be a multiple of physical page size
-  CHECK(page_size_ % phy_page_size_ == 0)
-      << "Logical page size " << page_size_
-      << " must be a multiple of physical page size " << phy_page_size_;
-
   // Align size to page_size_
   size_ = align_up(size, page_size_);
   vaddr_ = alloc_virtual_mem(size_);
@@ -79,10 +72,10 @@ XTensor::~XTensor() {
 
   if (vaddr_) {
     // Unmap all physical pages first
-    for (size_t offset = 0; offset < size_; offset += phy_page_size_) {
+    for (size_t offset = 0; offset < size_; offset += page_size_) {
       VirPtr addr = reinterpret_cast<VirPtr>(
           reinterpret_cast<uintptr_t>(vaddr_) + offset);
-      vmm::unmap(addr, phy_page_size_);
+      vmm::unmap(addr, page_size_);
     }
     // Release virtual memory
     vmm::release_vir_ptr(vaddr_, size_);
@@ -91,89 +84,59 @@ XTensor::~XTensor() {
 
 bool XTensor::map(offset_t offset) {
   CHECK(offset % page_size_ == 0)
-      << "Offset not aligned to logical page size: " << offset;
+      << "Offset not aligned to page size: " << offset;
 
-  // One logical page may contain multiple physical pages
-  // Map all physical pages within this logical page
-  size_t num_phy_pages = page_size_ / phy_page_size_;
+  page_id_t page_id = offset / page_size_;
 
-  // Check if any physical page is already mapped
-  for (size_t i = 0; i < num_phy_pages; ++i) {
-    size_t phy_offset = offset + i * phy_page_size_;
-    page_id_t phy_page_id = phy_offset / phy_page_size_;
-    if (mapping_.find(phy_page_id) != mapping_.end()) {
-      LOG(ERROR) << "Physical page " << phy_page_id << " is already mapped.";
-      return false;
-    }
+  // Check if already mapped (idempotent: return true if already mapped)
+  if (mapping_.find(page_id) != mapping_.end()) {
+    return true;
   }
 
-  // Batch get all physical pages needed
-  auto phy_pages = PhyPagePool::get_instance().batch_get(num_phy_pages);
-  if (phy_pages.empty() && num_phy_pages > 0) {
-    LOG(ERROR) << "Failed to get " << num_phy_pages
-               << " physical pages from pool";
+  // Get a physical page from pool
+  auto phy_pages = PhyPagePool::get_instance().batch_get(1);
+  if (phy_pages.empty()) {
+    LOG(ERROR) << "Failed to get physical page from pool";
     return false;
   }
 
-  // Map each physical page
-  for (size_t i = 0; i < num_phy_pages; ++i) {
-    size_t phy_offset = offset + i * phy_page_size_;
-    page_id_t phy_page_id = phy_offset / phy_page_size_;
+  // Map the physical page
+  VirPtr vaddr =
+      reinterpret_cast<VirPtr>(reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  vmm::unmap(vaddr, page_size_);
 
-    VirPtr vaddr = reinterpret_cast<VirPtr>(
-        reinterpret_cast<uintptr_t>(vaddr_) + phy_offset);
-    vmm::unmap(vaddr, phy_page_size_);
+  PhyMemHandle phy_handle = phy_pages[0]->get_phy_handle();
+  vmm::map(vaddr, phy_handle);
 
-    PhyMemHandle phy_handle = phy_pages[i]->get_phy_handle();
-    vmm::map(vaddr, phy_handle);
-
-    mapping_[phy_page_id] = std::move(phy_pages[i]);
-  }
+  mapping_[page_id] = std::move(phy_pages[0]);
   return true;
 }
 
 bool XTensor::unmap(offset_t offset) {
   CHECK(offset % page_size_ == 0)
-      << "Offset not aligned to logical page size: " << offset;
+      << "Offset not aligned to page size: " << offset;
 
-  // One logical page may contain multiple physical pages
-  // Unmap all physical pages within this logical page
-  size_t num_phy_pages = page_size_ / phy_page_size_;
+  page_id_t page_id = offset / page_size_;
 
-  // Collect pages to return in batch
+  auto it = mapping_.find(page_id);
+  if (it == mapping_.end()) {
+    // Already unmapped (idempotent: return true)
+    return true;
+  }
+
+  VirPtr vaddr =
+      reinterpret_cast<VirPtr>(reinterpret_cast<uintptr_t>(vaddr_) + offset);
+  vmm::unmap(vaddr, page_size_);
+
+  // Map the zero page instead to ensure memory integrity
+  map_phy_page_(zero_page_, offset);
+
+  // Return the physical page to pool
   std::vector<std::unique_ptr<PhyPage>> pages_to_return;
-  pages_to_return.reserve(num_phy_pages);
+  pages_to_return.push_back(std::move(it->second));
+  mapping_.erase(it);
+  PhyPagePool::get_instance().batch_put(pages_to_return);
 
-  for (size_t i = 0; i < num_phy_pages; ++i) {
-    size_t phy_offset = offset + i * phy_page_size_;
-    page_id_t phy_page_id = phy_offset / phy_page_size_;
-
-    auto it = mapping_.find(phy_page_id);
-    if (it == mapping_.end()) {
-      LOG(ERROR) << "Physical page " << phy_page_id << " is not mapped.";
-      // Return already collected pages before failing
-      if (!pages_to_return.empty()) {
-        PhyPagePool::get_instance().batch_put(pages_to_return);
-      }
-      return false;
-    }
-
-    VirPtr vaddr = reinterpret_cast<VirPtr>(
-        reinterpret_cast<uintptr_t>(vaddr_) + phy_offset);
-    vmm::unmap(vaddr, phy_page_size_);
-
-    // Map the zero page instead to ensure memory integrity.
-    map_phy_page_(zero_page_, phy_offset);
-
-    // Collect the physical page for batch return
-    pages_to_return.push_back(std::move(it->second));
-    mapping_.erase(it);
-  }
-
-  // Return all pages to pool in one lock
-  if (!pages_to_return.empty()) {
-    PhyPagePool::get_instance().batch_put(pages_to_return);
-  }
   return true;
 }
 
@@ -202,8 +165,8 @@ bool XTensor::unmap_all() {
 }
 
 bool XTensor::map_phy_page_(PhyPage* page, offset_t offset) {
-  CHECK(offset % phy_page_size_ == 0)
-      << "Offset not aligned to physical page size: " << offset;
+  CHECK(offset % page_size_ == 0)
+      << "Offset not aligned to page size: " << offset;
   CHECK(page) << "Page is null";
 
   VirPtr vaddr =
@@ -214,14 +177,13 @@ bool XTensor::map_phy_page_(PhyPage* page, offset_t offset) {
 }
 
 bool XTensor::init_with_zero_() {
-  CHECK(reinterpret_cast<uintptr_t>(vaddr_) % phy_page_size_ == 0)
-      << "vaddr not aligned to physical page size";
-  CHECK(size_ % phy_page_size_ == 0)
-      << "size not aligned to physical page size";
+  CHECK(reinterpret_cast<uintptr_t>(vaddr_) % page_size_ == 0)
+      << "vaddr not aligned to page size";
+  CHECK(size_ % page_size_ == 0) << "size not aligned to page size";
 
   bool succ = true;
-  // Initialize all physical pages with zero page
-  for (size_t offset = 0; offset < size_; offset += phy_page_size_) {
+  // Initialize all pages with zero page
+  for (size_t offset = 0; offset < size_; offset += page_size_) {
     if (!map_phy_page_(zero_page_, offset)) {
       succ = false;
       break;

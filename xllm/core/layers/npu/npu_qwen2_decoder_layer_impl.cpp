@@ -188,7 +188,6 @@ void Qwen2DecoderLayerImpl::merge_loaded_weights() {
     atb_weight_tensors_[i] =
         atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
   }
-
   init_layer();
 }
 

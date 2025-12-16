@@ -24,7 +24,9 @@ limitations under the License.
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "virt_page.h"
@@ -45,21 +47,17 @@ constexpr double PREALLOC_THREAD_TIMEOUT = 2.0;  // seconds
  * - VirtPage: Logical page for KV cache indexing, based on single-layer memory
  * - PhyPage: Physical memory page (2MB), managed by PhyPagePool
  *
+ * Multi-model support:
+ * - Each model has its own logical page_list (virtual pages)
+ * - All models share physical pages (phy_pages)
+ * - Model sleep: stops prealloc thread, unmaps and releases physical pages
+ * - Model wakeup: restarts prealloc thread to refill physical pages
+ *
  * Memory layout:
  * - For non-contiguous: each layer has its own K and V XTensor
  *   - mem_size_per_layer = total_phy_mem / (2 * num_layers)
  *   - num_virt_pages = mem_size_per_layer / virt_page_size
  *   - Allocating 1 virt_page consumes (2 * num_layers) phy_pages
- *
- * - For contiguous: all layers share one K and one V XTensor
- *   - contiguous_page_size = virt_page_size * num_layers
- *   - num_virt_pages = total_phy_mem / 2 / contiguous_page_size
- *   - Allocating 1 virt_page consumes (2 * contiguous_page_size /
- * phy_page_size) phy_pages
- *
- * Offset calculation:
- * - offset = virt_page_id * virt_page_size (for single-layer XTensor)
- * - This offset is used for XTensor::map/unmap operations
  *
  * This is a singleton class shared by all XTensorBlockManagerImpl instances.
  */
@@ -71,56 +69,119 @@ class PageAllocator {
     return allocator;
   }
 
-  // Initialize the allocator
-  // num_layers: number of transformer layers
+  // Initialize the allocator (basic initialization)
   // num_phy_pages: total number of physical pages from PhyPagePool
   // dp_size: number of data parallel groups
   // enable_page_prealloc: whether to enable background preallocation
-  void init(int64_t num_layers,
-            size_t num_phy_pages,
+  void init(size_t num_phy_pages,
             int32_t dp_size = 1,
             bool enable_page_prealloc = PAGE_PREALLOC_ENABLED);
 
   // Check if initialized
   bool is_initialized() const { return initialized_; }
 
+  // ============ Multi-Model Management ============
+  // Register a model with its layer count
+  // model_id: unique identifier for the model (e.g. model name from options)
+  // num_layers: number of transformer layers for this model
+  // Returns true if registration successful
+  bool register_model(const std::string& model_id, int64_t num_layers);
+
+  // Unregister a model (releases all its resources)
+  void unregister_model(const std::string& model_id);
+
+  // Put a model to sleep:
+  // - Stop preallocation for this model
+  // - Unmap all mapped virtual pages
+  // - Release physical pages back to shared pool
+  void sleep_model(const std::string& model_id);
+
+  // Wake up a sleeping model:
+  // - Resume preallocation for this model
+  void wakeup_model(const std::string& model_id);
+
+  // Check if a model is sleeping
+  bool is_model_sleeping(const std::string& model_id) const;
+
   // Start preallocation thread (called after reserving null block)
   void start_prealloc_thread();
 
   // ============ KV Cache Page Allocation ============
   // Allocate a virtual page for KV cache
+  // model_id: which model this allocation is for
   // dp_rank: which DP group this allocation is for
   // Consumes phy_pages_per_virt_page_ physical pages
   // Returns nullptr if no physical pages available
-  std::unique_ptr<VirtPage> alloc_kv_cache_page(int32_t dp_rank);
+  std::unique_ptr<VirtPage> alloc_kv_cache_page(const std::string& model_id,
+                                                int32_t dp_rank);
 
   // Free a single KV cache virtual page
-  void free_kv_cache_page(int32_t dp_rank, int64_t virt_page_id);
+  void free_kv_cache_page(const std::string& model_id,
+                          int32_t dp_rank,
+                          int64_t virt_page_id);
 
   // Free multiple KV cache virtual pages
-  void free_kv_cache_pages(int32_t dp_rank,
+  void free_kv_cache_pages(const std::string& model_id,
+                           int32_t dp_rank,
                            const std::vector<int64_t>& virt_page_ids);
 
   // Trim reserved KV cache pages (unmap physical pages)
-  void trim_kv_cache(int32_t dp_rank);
+  void trim_kv_cache(const std::string& model_id, int32_t dp_rank);
 
   // ============ Weight Page Allocation ============
   // Allocate physical pages for weight tensor (full map)
+  // model_id: which model this allocation is for
   // num_pages: number of physical pages (aligned up from weight size)
   // All-or-nothing: returns true if all pages allocated, false otherwise
-  bool alloc_weight_pages(size_t num_pages);
+  bool alloc_weight_pages(const std::string& model_id, size_t num_pages);
 
   // Free physical pages from weight tensor
+  // model_id: which model
   // num_pages: same count used in alloc_weight_pages
-  void free_weight_pages(size_t num_pages);
+  void free_weight_pages(const std::string& model_id, size_t num_pages);
 
-  // Virtual page getters (for specific DP group)
-  size_t get_num_free_virt_pages(int32_t dp_rank) const;
-  size_t get_num_inuse_virt_pages(int32_t dp_rank) const;
-  size_t get_num_total_virt_pages() const;
-  size_t get_num_reserved_virt_pages(int32_t dp_rank) const;
+  // ============ Legacy single-model interfaces (model_id = "") ============
+  // For backward compatibility with existing code
+  std::unique_ptr<VirtPage> alloc_kv_cache_page(int32_t dp_rank) {
+    return alloc_kv_cache_page("", dp_rank);
+  }
+  void free_kv_cache_page(int32_t dp_rank, int64_t virt_page_id) {
+    free_kv_cache_page("", dp_rank, virt_page_id);
+  }
+  void free_kv_cache_pages(int32_t dp_rank,
+                           const std::vector<int64_t>& virt_page_ids) {
+    free_kv_cache_pages("", dp_rank, virt_page_ids);
+  }
+  void trim_kv_cache(int32_t dp_rank) { trim_kv_cache("", dp_rank); }
+  bool alloc_weight_pages(size_t num_pages) {
+    return alloc_weight_pages("", num_pages);
+  }
+  void free_weight_pages(size_t num_pages) { free_weight_pages("", num_pages); }
 
-  // Physical page getters
+  // Virtual page getters (for specific model and DP group)
+  size_t get_num_free_virt_pages(const std::string& model_id,
+                                 int32_t dp_rank) const;
+  size_t get_num_inuse_virt_pages(const std::string& model_id,
+                                  int32_t dp_rank) const;
+  size_t get_num_total_virt_pages(const std::string& model_id) const;
+  size_t get_num_reserved_virt_pages(const std::string& model_id,
+                                     int32_t dp_rank) const;
+
+  // Legacy single-model getters (model_id = "")
+  size_t get_num_free_virt_pages(int32_t dp_rank) const {
+    return get_num_free_virt_pages("", dp_rank);
+  }
+  size_t get_num_inuse_virt_pages(int32_t dp_rank) const {
+    return get_num_inuse_virt_pages("", dp_rank);
+  }
+  size_t get_num_total_virt_pages() const {
+    return get_num_total_virt_pages("");
+  }
+  size_t get_num_reserved_virt_pages(int32_t dp_rank) const {
+    return get_num_reserved_virt_pages("", dp_rank);
+  }
+
+  // Physical page getters (shared across all models)
   size_t get_num_free_phy_pages() const;
   size_t get_num_total_phy_pages() const;
 
@@ -132,10 +193,16 @@ class PageAllocator {
 
   // Get configuration
   size_t page_size() const { return page_size_; }
-  int64_t num_layers() const { return num_layers_; }
+  int64_t num_layers(const std::string& model_id) const;
+
+  // Legacy single-model version (model_id = "")
+  int64_t num_layers() const { return num_layers(""); }
 
   // Get number of physical pages consumed per virtual page allocation
-  size_t phy_pages_per_virt_page() const { return phy_pages_per_virt_page_; }
+  size_t phy_pages_per_virt_page(const std::string& model_id) const;
+
+  // Legacy single-model version (model_id = "")
+  size_t phy_pages_per_virt_page() const { return phy_pages_per_virt_page(""); }
 
  private:
   PageAllocator() = default;
@@ -143,12 +210,35 @@ class PageAllocator {
   PageAllocator(const PageAllocator&) = delete;
   PageAllocator& operator=(const PageAllocator&) = delete;
 
+  // Per-DP group virtual page tracking
+  struct DpGroupPages {
+    size_t num_free_virt_pages{0};            // Protected by mtx_
+    std::deque<int64_t> free_virt_page_list;  // Unmapped virtual pages
+    std::deque<int64_t>
+        reserved_virt_page_list;  // Mapped virtual pages ready for use
+    std::set<int64_t>
+        allocated_virt_page_list;  // Mapped virtual pages in use by block mgr
+  };
+
+  // Per-model state
+  struct ModelState {
+    int64_t num_layers = 0;
+    size_t num_total_virt_pages = 0;
+    size_t phy_pages_per_virt_page = 0;
+    size_t weight_pages_allocated = 0;
+    bool is_sleeping = false;
+    // Count of pending map operations (for safe sleep)
+    std::atomic<int> pending_map_ops{0};
+    std::vector<DpGroupPages> dp_group_pages;
+  };
+
   // Check if enough physical pages available for allocation
-  bool has_enough_phy_pages(size_t num_virt_pages) const;
+  bool has_enough_phy_pages(size_t num_phy_pages) const;
 
   // Consume/release physical pages (update tracking)
-  void consume_phy_pages(size_t count);
-  void release_phy_pages(size_t count);
+  // Returns false if not enough physical pages available
+  bool consume_phy_pages(size_t num_phy_pages);
+  void release_phy_pages(size_t num_phy_pages);
 
   // Preallocation worker thread function
   void prealloc_worker();
@@ -161,42 +251,33 @@ class PageAllocator {
   void trigger_preallocation();
 
   // Map/unmap virtual pages (broadcasts to workers in dp_rank group)
-  void map_virt_pages(int32_t dp_rank,
+  // Returns false if broadcast fails
+  bool map_virt_pages(int32_t dp_rank,
                       const std::vector<int64_t>& virt_page_ids);
-  void unmap_virt_pages(int32_t dp_rank,
+  bool unmap_virt_pages(int32_t dp_rank,
                         const std::vector<int64_t>& virt_page_ids);
 
   // Update memory usage tracking
   void update_memory_usage();
 
+  // Get model state (throws if not found)
+  ModelState& get_model_state(const std::string& model_id);
+  const ModelState& get_model_state(const std::string& model_id) const;
+
   // Initialization state
   bool initialized_ = false;
 
   // Configuration
-  int64_t num_layers_ = 0;
   int32_t dp_size_ = 1;
   size_t page_size_ = 0;  // Page size (from FLAGS_phy_page_granularity_size)
   bool enable_page_prealloc_ = PAGE_PREALLOC_ENABLED;
 
-  // Derived values
-  size_t num_total_virt_pages_ =
-      0;  // Total virtual pages (based on single layer)
+  // Physical page tracking (shared across all models)
   size_t num_total_phy_pages_ = 0;  // Total physical pages from PhyPagePool
-  size_t phy_pages_per_virt_page_ =
-      0;  // Physical pages consumed per virt_page alloc
+  size_t num_free_phy_pages_ = 0;   // Available physical pages
 
-  // Per-DP group virtual page tracking
-  // Each DP group has its own free_virt_page_list and reserved_virt_page_list
-  struct DpGroupPages {
-    size_t num_free_virt_pages{0};            // Protected by mtx_
-    std::deque<int64_t> free_virt_page_list;  // Unmapped virtual pages
-    std::deque<int64_t>
-        reserved_virt_page_list;  // Mapped virtual pages ready for use
-  };
-  std::vector<DpGroupPages> dp_group_pages_;
-
-  // Physical page tracking (shared across all DP groups)
-  size_t num_free_phy_pages_ = 0;  // Available physical pages
+  // Per-model state (key is model_id from options)
+  std::unordered_map<std::string, ModelState> model_states_;
 
   // Reserved page limits
   int32_t min_reserved_pages_ = MIN_RESERVED_PAGES;

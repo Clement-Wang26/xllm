@@ -100,8 +100,8 @@ void VLMEngine::process_group_test() {
 #endif
 }
 
-bool VLMEngine::init() {
-  if (!init_model()) {
+bool VLMEngine::init(int32_t master_status) {
+  if (!init_model(master_status)) {
     LOG(ERROR) << "Failed to init model from: " << options_.model_path();
     return false;
   }
@@ -116,7 +116,7 @@ bool VLMEngine::init() {
   return true;
 }
 
-bool VLMEngine::init_model() {
+bool VLMEngine::init_model(int32_t master_status) {
   const std::string& model_path = options_.model_path();
   auto model_loader = ModelLoader::create(model_path);
   LOG(INFO) << "Initializing model from: " << model_path;
@@ -168,7 +168,8 @@ bool VLMEngine::init_model() {
   std::vector<folly::SemiFuture<bool>> futures;
   futures.reserve(worker_clients_num_);
   for (auto& worker : worker_clients_) {
-    futures.push_back(worker->init_model_async(model_path, FLAGS_random_seed));
+    futures.push_back(
+        worker->init_model_async(model_path, FLAGS_random_seed, master_status));
   }
   // wait for all futures to complete
   auto results = folly::collectAll(futures).get();

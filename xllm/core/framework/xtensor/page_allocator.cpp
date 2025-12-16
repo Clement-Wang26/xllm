@@ -28,8 +28,7 @@ limitations under the License.
 
 namespace xllm {
 
-void PageAllocator::init(int64_t num_layers,
-                         size_t num_phy_pages,
+void PageAllocator::init(size_t num_phy_pages,
                          int32_t dp_size,
                          bool enable_page_prealloc) {
   std::lock_guard<std::mutex> lock(mtx_);
@@ -39,7 +38,6 @@ void PageAllocator::init(int64_t num_layers,
     return;
   }
 
-  num_layers_ = num_layers;
   dp_size_ = dp_size;
   page_size_ = FLAGS_phy_page_granularity_size;
   enable_page_prealloc_ = enable_page_prealloc;
@@ -48,38 +46,12 @@ void PageAllocator::init(int64_t num_layers,
   num_total_phy_pages_ = num_phy_pages;
   num_free_phy_pages_ = num_total_phy_pages_;
 
-  // Calculate virtual pages based on single-layer memory size
-  // Virtual pages are per-DP group, so divide by dp_size
-  num_total_virt_pages_ = num_total_phy_pages_ / num_layers_;
-
-  // Calculate physical pages consumed per virtual page allocation
-  // Each virt_page needs to map on all K and V XTensors
-  // page_size is the same for both virt and phy pages
-  // So each XTensor map consumes 1 phy_page
-  // Total = 2 * num_layers (for K and V of each layer)
-  phy_pages_per_virt_page_ = 2 * num_layers_;
-
-  CHECK(phy_pages_per_virt_page_ > 0) << "phy_pages_per_virt_page must be > 0";
-
-  // Initialize per-DP group page lists
-  dp_group_pages_.resize(dp_size_);
-  for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
-    auto& dp_pages = dp_group_pages_[dp_rank];
-    dp_pages.num_free_virt_pages = num_total_virt_pages_;
-    for (size_t i = 0; i < num_total_virt_pages_; ++i) {
-      dp_pages.free_virt_page_list.push_back(static_cast<int64_t>(i));
-    }
-  }
-
   initialized_ = true;
 
   LOG(INFO) << "Init PageAllocator: "
-            << "num_layers=" << num_layers << ", dp_size=" << dp_size_
+            << "dp_size=" << dp_size_
             << ", page_size=" << page_size_ / (1024 * 1024) << "MB"
-            << ", num_total_virt_pages=" << num_total_virt_pages_
-            << " (per dp_group)"
             << ", num_total_phy_pages=" << num_total_phy_pages_
-            << ", phy_pages_per_virt_page=" << phy_pages_per_virt_page_
             << ", enable_prealloc=" << enable_page_prealloc;
 }
 
@@ -93,41 +65,245 @@ PageAllocator::~PageAllocator() {
   }
 }
 
+bool PageAllocator::register_model(const std::string& model_id,
+                                   int64_t num_layers) {
+  std::lock_guard<std::mutex> lock(mtx_);
+
+  CHECK(initialized_) << "PageAllocator not initialized";
+
+  if (model_states_.find(model_id) != model_states_.end()) {
+    LOG(WARNING) << "Model " << model_id << " already registered";
+    return false;
+  }
+
+  // Create state directly in map to avoid atomic assignment issues
+  auto& state = model_states_[model_id];
+  state.num_layers = num_layers;
+  // Calculate virtual pages based on single-layer memory size
+  state.num_total_virt_pages = num_total_phy_pages_ / num_layers;
+  // Each virt_page needs to map on all K and V XTensors
+  state.phy_pages_per_virt_page = 2 * num_layers;
+  state.is_sleeping = false;
+
+  // Initialize per-DP group page lists
+  state.dp_group_pages.resize(dp_size_);
+  for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+    auto& dp_pages = state.dp_group_pages[dp_rank];
+    dp_pages.num_free_virt_pages = state.num_total_virt_pages;
+    for (size_t i = 0; i < state.num_total_virt_pages; ++i) {
+      dp_pages.free_virt_page_list.push_back(static_cast<int64_t>(i));
+    }
+  }
+
+  LOG(INFO) << "Registered model " << model_id << ": "
+            << "num_layers=" << num_layers << ", num_total_virt_pages="
+            << model_states_[model_id].num_total_virt_pages
+            << ", phy_pages_per_virt_page="
+            << model_states_[model_id].phy_pages_per_virt_page;
+
+  return true;
+}
+
+void PageAllocator::unregister_model(const std::string& model_id) {
+  std::lock_guard<std::mutex> lock(mtx_);
+
+  auto it = model_states_.find(model_id);
+  if (it == model_states_.end()) {
+    LOG(WARNING) << "Model " << model_id << " not found for unregister";
+    return;
+  }
+
+  // Release any weight pages
+  if (it->second.weight_pages_allocated > 0) {
+    num_free_phy_pages_ += it->second.weight_pages_allocated;
+  }
+
+  model_states_.erase(it);
+  LOG(INFO) << "Unregistered model " << model_id;
+}
+
+void PageAllocator::sleep_model(const std::string& model_id) {
+  std::vector<std::pair<int32_t, std::vector<int64_t>>> pages_to_unmap;
+  size_t total_phy_pages_to_release = 0;
+  size_t phy_pages_per_virt = 0;
+
+  {
+    std::unique_lock<std::mutex> lock(mtx_);
+
+    auto it = model_states_.find(model_id);
+    if (it == model_states_.end()) {
+      LOG(WARNING) << "Model " << model_id << " not found for sleep";
+      return;
+    }
+
+    ModelState& state = it->second;
+    if (state.is_sleeping) {
+      LOG(WARNING) << "Model " << model_id << " is already sleeping";
+      return;
+    }
+
+    // Wait for pending map/unmap operations to complete
+    while (state.pending_map_ops.load() > 0) {
+      LOG(INFO) << "Waiting for " << state.pending_map_ops.load()
+                << " pending map ops to complete before sleeping model "
+                << model_id;
+      cond_.wait(lock);
+    }
+
+    state.is_sleeping = true;
+    phy_pages_per_virt = state.phy_pages_per_virt_page;
+
+    // Collect all mapped pages (reserved + allocated) from each DP group
+    for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+      auto& dp_pages = state.dp_group_pages[dp_rank];
+      std::vector<int64_t> virt_page_ids;
+
+      // Collect reserved pages
+      virt_page_ids.insert(virt_page_ids.end(),
+                           dp_pages.reserved_virt_page_list.begin(),
+                           dp_pages.reserved_virt_page_list.end());
+
+      // Collect allocated pages (in use by block manager)
+      virt_page_ids.insert(virt_page_ids.end(),
+                           dp_pages.allocated_virt_page_list.begin(),
+                           dp_pages.allocated_virt_page_list.end());
+
+      if (!virt_page_ids.empty()) {
+        total_phy_pages_to_release += virt_page_ids.size() * phy_pages_per_virt;
+        pages_to_unmap.emplace_back(dp_rank, std::move(virt_page_ids));
+      }
+    }
+
+    LOG(INFO) << "Sleeping model " << model_id << ", will release "
+              << total_phy_pages_to_release << " physical pages";
+  }
+
+  // Unmap pages outside the lock
+  for (auto& [dp_rank, virt_page_ids] : pages_to_unmap) {
+    if (!virt_page_ids.empty()) {
+      unmap_virt_pages(dp_rank, virt_page_ids);
+    }
+  }
+
+  // Update state after unmapping
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto it = model_states_.find(model_id);
+    if (it != model_states_.end()) {
+      ModelState& state = it->second;
+      for (auto& [dp_rank, virt_page_ids] : pages_to_unmap) {
+        auto& dp_pages = state.dp_group_pages[dp_rank];
+        // Move all unmapped pages back to free list
+        for (int64_t virt_page_id : virt_page_ids) {
+          dp_pages.free_virt_page_list.push_back(virt_page_id);
+        }
+        // Clear both reserved and allocated lists
+        dp_pages.reserved_virt_page_list.clear();
+        dp_pages.allocated_virt_page_list.clear();
+      }
+      // Release physical pages back to shared pool
+      num_free_phy_pages_ += total_phy_pages_to_release;
+      update_memory_usage();
+      cond_.notify_all();
+    }
+  }
+
+  LOG(INFO) << "Model " << model_id << " is now sleeping";
+}
+
+void PageAllocator::wakeup_model(const std::string& model_id) {
+  {
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    auto it = model_states_.find(model_id);
+    if (it == model_states_.end()) {
+      LOG(WARNING) << "Model " << model_id << " not found for wakeup";
+      return;
+    }
+
+    ModelState& state = it->second;
+    if (!state.is_sleeping) {
+      LOG(WARNING) << "Model " << model_id << " is not sleeping";
+      return;
+    }
+
+    state.is_sleeping = false;
+    LOG(INFO) << "Waking up model " << model_id;
+  }
+
+  // Trigger preallocation to refill reserved pages
+  if (enable_page_prealloc_) {
+    trigger_preallocation();
+  }
+
+  LOG(INFO) << "Model " << model_id << " is now awake";
+}
+
+bool PageAllocator::is_model_sleeping(const std::string& model_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  auto it = model_states_.find(model_id);
+  if (it == model_states_.end()) {
+    return false;
+  }
+  return it->second.is_sleeping;
+}
+
 void PageAllocator::start_prealloc_thread() {
   if (enable_page_prealloc_) {
     start_prealloc_thread_internal();
   }
 }
 
-bool PageAllocator::has_enough_phy_pages(size_t num_virt_pages) const {
+bool PageAllocator::has_enough_phy_pages(size_t num_phy_pages) const {
   // Note: Caller must hold mtx_
-  size_t needed_phy = num_virt_pages * phy_pages_per_virt_page_;
-  return num_free_phy_pages_ >= needed_phy;
+  return num_free_phy_pages_ >= num_phy_pages;
 }
 
-void PageAllocator::consume_phy_pages(size_t count) {
+bool PageAllocator::consume_phy_pages(size_t num_phy_pages) {
   // Note: Caller must hold mtx_
-  size_t needed = count * phy_pages_per_virt_page_;
-  CHECK(num_free_phy_pages_ >= needed)
-      << "Not enough physical pages: need " << needed << ", available "
-      << num_free_phy_pages_;
-  num_free_phy_pages_ -= needed;
+  if (num_free_phy_pages_ < num_phy_pages) {
+    LOG(WARNING) << "Not enough physical pages: need " << num_phy_pages
+                 << ", available " << num_free_phy_pages_;
+    return false;
+  }
+  num_free_phy_pages_ -= num_phy_pages;
+  return true;
 }
 
-void PageAllocator::release_phy_pages(size_t count) {
-  size_t released = count * phy_pages_per_virt_page_;
-  num_free_phy_pages_ += released;
+void PageAllocator::release_phy_pages(size_t num_phy_pages) {
+  num_free_phy_pages_ += num_phy_pages;
 }
 
-std::unique_ptr<VirtPage> PageAllocator::alloc_kv_cache_page(int32_t dp_rank) {
+PageAllocator::ModelState& PageAllocator::get_model_state(
+    const std::string& model_id) {
+  auto it = model_states_.find(model_id);
+  CHECK(it != model_states_.end()) << "Model " << model_id << " not registered";
+  return it->second;
+}
+
+const PageAllocator::ModelState& PageAllocator::get_model_state(
+    const std::string& model_id) const {
+  auto it = model_states_.find(model_id);
+  CHECK(it != model_states_.end()) << "Model " << model_id << " not registered";
+  return it->second;
+}
+
+std::unique_ptr<VirtPage> PageAllocator::alloc_kv_cache_page(
+    const std::string& model_id,
+    int32_t dp_rank) {
   std::unique_lock<std::mutex> lock(mtx_);
 
   CHECK(initialized_) << "PageAllocator not initialized";
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
 
-  auto& dp_pages = dp_group_pages_[dp_rank];
+  ModelState& state = get_model_state(model_id);
+  CHECK(!state.is_sleeping)
+      << "Cannot allocate from sleeping model " << model_id;
+
+  auto& dp_pages = state.dp_group_pages[dp_rank];
   std::optional<int64_t> virt_page_id;
+  size_t phy_pages_needed = state.phy_pages_per_virt_page;
 
   while (!virt_page_id.has_value()) {
     // Fast path: allocate from reserved pages (already mapped)
@@ -144,25 +320,36 @@ std::unique_ptr<VirtPage> PageAllocator::alloc_kv_cache_page(int32_t dp_rank) {
         cond_.notify_all();
       }
 
+      // Track this page as allocated
+      dp_pages.allocated_virt_page_list.insert(*virt_page_id);
+
       update_memory_usage();
       return std::make_unique<VirtPage>(*virt_page_id, page_size_);
     }
 
     // Slow path: allocate from free pages (need to map)
-    if (!dp_pages.free_virt_page_list.empty() && has_enough_phy_pages(1)) {
+    if (!dp_pages.free_virt_page_list.empty() &&
+        has_enough_phy_pages(phy_pages_needed)) {
       virt_page_id = dp_pages.free_virt_page_list.front();
       dp_pages.free_virt_page_list.pop_front();
       dp_pages.num_free_virt_pages--;
-      consume_phy_pages(1);
+      if (!consume_phy_pages(phy_pages_needed)) {
+        // Rollback: put the page back
+        dp_pages.free_virt_page_list.push_front(*virt_page_id);
+        dp_pages.num_free_virt_pages++;
+        virt_page_id.reset();
+        continue;  // Try again or wait
+      }
       break;
     }
 
     // Check if we're out of resources
     if (dp_pages.free_virt_page_list.empty()) {
-      throw std::runtime_error("No free virtual pages left for dp_rank " +
+      throw std::runtime_error("No free virtual pages left for model " +
+                               model_id + " dp_rank " +
                                std::to_string(dp_rank));
     }
-    if (!has_enough_phy_pages(1)) {
+    if (!has_enough_phy_pages(phy_pages_needed)) {
       throw std::runtime_error("No free physical pages left");
     }
 
@@ -177,91 +364,134 @@ std::unique_ptr<VirtPage> PageAllocator::alloc_kv_cache_page(int32_t dp_rank) {
 
   CHECK(virt_page_id.has_value()) << "Virtual page ID should be set";
 
+  // Increment pending ops before releasing lock
+  state.pending_map_ops.fetch_add(1);
+
   // Release lock before mapping (slow path)
   lock.unlock();
 
-  try {
-    map_virt_pages(dp_rank, {*virt_page_id});
-  } catch (const std::exception& e) {
-    // If mapping fails, return page to free list and restore phy pages
+  bool map_success = map_virt_pages(dp_rank, {*virt_page_id});
+
+  // Decrement pending ops and notify waiters
+  {
     std::lock_guard<std::mutex> guard(mtx_);
-    dp_pages.free_virt_page_list.push_front(*virt_page_id);
-    dp_pages.num_free_virt_pages++;
-    release_phy_pages(1);
+    state.pending_map_ops.fetch_sub(1);
     cond_.notify_all();
-    throw std::runtime_error("Failed to map virtual page " +
-                             std::to_string(*virt_page_id) + ": " + e.what());
+
+    if (!map_success) {
+      // If mapping fails, return page to free list and restore phy pages
+      dp_pages.free_virt_page_list.push_front(*virt_page_id);
+      dp_pages.num_free_virt_pages++;
+      release_phy_pages(phy_pages_needed);
+      LOG(ERROR) << "Failed to map virtual page " << *virt_page_id;
+      return nullptr;
+    }
   }
 
   if (enable_page_prealloc_) {
     trigger_preallocation();
   }
 
-  update_memory_usage();
+  // Track this page as allocated
+  {
+    std::lock_guard<std::mutex> guard(mtx_);
+    dp_pages.allocated_virt_page_list.insert(*virt_page_id);
+    update_memory_usage();
+  }
+
   return std::make_unique<VirtPage>(*virt_page_id, page_size_);
 }
 
-void PageAllocator::free_kv_cache_page(int32_t dp_rank, int64_t virt_page_id) {
+void PageAllocator::free_kv_cache_page(const std::string& model_id,
+                                       int32_t dp_rank,
+                                       int64_t virt_page_id) {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
 
-  auto& dp_pages = dp_group_pages_[dp_rank];
+  size_t phy_pages_per_virt = 0;
 
   {
     std::lock_guard<std::mutex> lock(mtx_);
 
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
+    phy_pages_per_virt = state.phy_pages_per_virt_page;
+
+    // Remove from allocated list
+    dp_pages.allocated_virt_page_list.erase(virt_page_id);
+
     dp_pages.num_free_virt_pages++;
-    if (dp_pages.reserved_virt_page_list.size() <
-        static_cast<size_t>(max_reserved_pages_)) {
-      // Fast path: keep page mapped for reuse (don't release phy pages)
+
+    // Fast path: keep page mapped for reuse if not sleeping and pool not full
+    if (!state.is_sleeping && dp_pages.reserved_virt_page_list.size() <
+                                  static_cast<size_t>(max_reserved_pages_)) {
       dp_pages.reserved_virt_page_list.push_back(virt_page_id);
       update_memory_usage();
       cond_.notify_all();
       return;
     }
+    // Slow path: need to unmap (model sleeping or reserved pool full)
   }
 
   // Slow path: unmap physical pages and add to free list
   unmap_virt_pages(dp_rank, {virt_page_id});
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
     dp_pages.free_virt_page_list.push_back(virt_page_id);
-    release_phy_pages(1);
+    release_phy_pages(phy_pages_per_virt);
     update_memory_usage();
     cond_.notify_all();
   }
 }
 
 void PageAllocator::free_kv_cache_pages(
+    const std::string& model_id,
     int32_t dp_rank,
     const std::vector<int64_t>& virt_page_ids) {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
 
-  auto& dp_pages = dp_group_pages_[dp_rank];
   std::vector<int64_t> pages_to_unmap;
+  size_t phy_pages_per_virt = 0;
 
   {
     std::lock_guard<std::mutex> lock(mtx_);
 
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
+    phy_pages_per_virt = state.phy_pages_per_virt_page;
+
+    // Remove all pages from allocated list
+    for (int64_t virt_page_id : virt_page_ids) {
+      dp_pages.allocated_virt_page_list.erase(virt_page_id);
+    }
+
     dp_pages.num_free_virt_pages += virt_page_ids.size();
-    size_t num_to_reserve =
-        max_reserved_pages_ - dp_pages.reserved_virt_page_list.size();
 
-    if (num_to_reserve > 0) {
-      // Fast path: keep some pages mapped for reuse
-      size_t actual_reserve = std::min(num_to_reserve, virt_page_ids.size());
-      for (size_t i = 0; i < actual_reserve; ++i) {
-        dp_pages.reserved_virt_page_list.push_back(virt_page_ids[i]);
-      }
-      cond_.notify_all();
-
-      // Remaining pages need to be unmapped
-      for (size_t i = actual_reserve; i < virt_page_ids.size(); ++i) {
-        pages_to_unmap.push_back(virt_page_ids[i]);
-      }
-    } else {
+    // If model is sleeping, unmap all pages
+    if (state.is_sleeping) {
       pages_to_unmap = virt_page_ids;
+    } else {
+      size_t num_to_reserve =
+          max_reserved_pages_ - dp_pages.reserved_virt_page_list.size();
+
+      if (num_to_reserve > 0) {
+        // Fast path: keep some pages mapped for reuse
+        size_t actual_reserve = std::min(num_to_reserve, virt_page_ids.size());
+        for (size_t i = 0; i < actual_reserve; ++i) {
+          dp_pages.reserved_virt_page_list.push_back(virt_page_ids[i]);
+        }
+        cond_.notify_all();
+
+        // Remaining pages need to be unmapped
+        for (size_t i = actual_reserve; i < virt_page_ids.size(); ++i) {
+          pages_to_unmap.push_back(virt_page_ids[i]);
+        }
+      } else {
+        pages_to_unmap = virt_page_ids;
+      }
     }
   }
 
@@ -274,24 +504,31 @@ void PageAllocator::free_kv_cache_pages(
   unmap_virt_pages(dp_rank, pages_to_unmap);
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
     for (int64_t virt_page_id : pages_to_unmap) {
       dp_pages.free_virt_page_list.push_back(virt_page_id);
     }
-    release_phy_pages(pages_to_unmap.size());
+    release_phy_pages(pages_to_unmap.size() * phy_pages_per_virt);
     update_memory_usage();
     cond_.notify_all();
   }
 }
 
-void PageAllocator::trim_kv_cache(int32_t dp_rank) {
+void PageAllocator::trim_kv_cache(const std::string& model_id,
+                                  int32_t dp_rank) {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
 
-  auto& dp_pages = dp_group_pages_[dp_rank];
   std::vector<int64_t> pages_to_unmap;
+  size_t phy_pages_per_virt = 0;
 
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
+    phy_pages_per_virt = state.phy_pages_per_virt_page;
+
     pages_to_unmap.assign(dp_pages.reserved_virt_page_list.begin(),
                           dp_pages.reserved_virt_page_list.end());
     dp_pages.reserved_virt_page_list.clear();
@@ -306,19 +543,24 @@ void PageAllocator::trim_kv_cache(int32_t dp_rank) {
 
   {
     std::lock_guard<std::mutex> lock(mtx_);
+    ModelState& state = get_model_state(model_id);
+    auto& dp_pages = state.dp_group_pages[dp_rank];
     for (int64_t virt_page_id : pages_to_unmap) {
       dp_pages.free_virt_page_list.push_back(virt_page_id);
     }
-    release_phy_pages(pages_to_unmap.size());
+    release_phy_pages(pages_to_unmap.size() * phy_pages_per_virt);
     update_memory_usage();
   }
 }
 
-bool PageAllocator::alloc_weight_pages(size_t num_pages) {
+bool PageAllocator::alloc_weight_pages(const std::string& model_id,
+                                       size_t num_pages) {
   {
     std::lock_guard<std::mutex> lock(mtx_);
 
     CHECK(initialized_) << "PageAllocator not initialized";
+
+    ModelState& state = get_model_state(model_id);
 
     // Allocate physical pages directly for weight tensor
     // All-or-nothing: either allocate all requested pages or fail
@@ -330,6 +572,7 @@ bool PageAllocator::alloc_weight_pages(size_t num_pages) {
     }
 
     num_free_phy_pages_ -= num_pages;
+    state.weight_pages_allocated = num_pages;
     update_memory_usage();
   }
 
@@ -341,17 +584,20 @@ bool PageAllocator::alloc_weight_pages(size_t num_pages) {
     // Rollback on failure
     std::lock_guard<std::mutex> lock(mtx_);
     num_free_phy_pages_ += num_pages;
+    ModelState& state = get_model_state(model_id);
+    state.weight_pages_allocated = 0;
     update_memory_usage();
     LOG(ERROR) << "Failed to map weight tensor: " << e.what();
     return false;
   }
 
   VLOG(1) << "Allocated and mapped " << num_pages
-          << " physical pages for weight tensor";
+          << " physical pages for weight tensor of model " << model_id;
   return true;
 }
 
-void PageAllocator::free_weight_pages(size_t num_pages) {
+void PageAllocator::free_weight_pages(const std::string& model_id,
+                                      size_t num_pages) {
   // Unmap weight tensor first (full unmap)
   try {
     auto& allocator = XTensorAllocator::get_instance();
@@ -366,38 +612,51 @@ void PageAllocator::free_weight_pages(size_t num_pages) {
 
     CHECK(initialized_) << "PageAllocator not initialized";
 
+    ModelState& state = get_model_state(model_id);
+    state.weight_pages_allocated = 0;
+
     num_free_phy_pages_ += num_pages;
     update_memory_usage();
     cond_.notify_all();
   }
 
   VLOG(1) << "Unmapped and freed " << num_pages
-          << " physical pages from weight tensor";
+          << " physical pages from weight tensor of model " << model_id;
 }
 
-size_t PageAllocator::get_num_free_virt_pages(int32_t dp_rank) const {
+size_t PageAllocator::get_num_free_virt_pages(const std::string& model_id,
+                                              int32_t dp_rank) const {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
   std::lock_guard<std::mutex> lock(mtx_);
-  return dp_group_pages_[dp_rank].num_free_virt_pages;
+  const ModelState& state = get_model_state(model_id);
+  return state.dp_group_pages[dp_rank].num_free_virt_pages;
 }
 
-size_t PageAllocator::get_num_inuse_virt_pages(int32_t dp_rank) const {
+size_t PageAllocator::get_num_inuse_virt_pages(const std::string& model_id,
+                                               int32_t dp_rank) const {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
   std::lock_guard<std::mutex> lock(mtx_);
-  return num_total_virt_pages_ - dp_group_pages_[dp_rank].num_free_virt_pages;
+  const ModelState& state = get_model_state(model_id);
+  return state.num_total_virt_pages -
+         state.dp_group_pages[dp_rank].num_free_virt_pages;
 }
 
-size_t PageAllocator::get_num_total_virt_pages() const {
-  return num_total_virt_pages_;
+size_t PageAllocator::get_num_total_virt_pages(
+    const std::string& model_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  const ModelState& state = get_model_state(model_id);
+  return state.num_total_virt_pages;
 }
 
-size_t PageAllocator::get_num_reserved_virt_pages(int32_t dp_rank) const {
+size_t PageAllocator::get_num_reserved_virt_pages(const std::string& model_id,
+                                                  int32_t dp_rank) const {
   CHECK_GE(dp_rank, 0) << "dp_rank must be >= 0";
   CHECK_LT(dp_rank, dp_size_) << "dp_rank must be < dp_size";
   std::lock_guard<std::mutex> lock(mtx_);
-  return dp_group_pages_[dp_rank].reserved_virt_page_list.size();
+  const ModelState& state = get_model_state(model_id);
+  return state.dp_group_pages[dp_rank].reserved_virt_page_list.size();
 }
 
 size_t PageAllocator::get_num_free_phy_pages() const {
@@ -419,10 +678,24 @@ offset_t PageAllocator::get_offset(int64_t virt_page_id) const {
   return virt_page_id * page_size_;
 }
 
+int64_t PageAllocator::num_layers(const std::string& model_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  const ModelState& state = get_model_state(model_id);
+  return state.num_layers;
+}
+
+size_t PageAllocator::phy_pages_per_virt_page(
+    const std::string& model_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  const ModelState& state = get_model_state(model_id);
+  return state.phy_pages_per_virt_page;
+}
+
 void PageAllocator::prealloc_worker() {
   while (prealloc_running_.load()) {
-    // Per-DP group pages to reserve
-    std::vector<std::pair<int32_t, std::vector<int64_t>>> dp_pages_to_reserve;
+    // Per-model, per-DP group pages to reserve
+    std::vector<std::tuple<std::string, int32_t, std::vector<int64_t>>>
+        model_dp_pages_to_reserve;
 
     {
       std::unique_lock<std::mutex> lock(mtx_);
@@ -438,74 +711,136 @@ void PageAllocator::prealloc_worker() {
 
       prealloc_needed_ = false;
 
-      // Check each DP group for preallocation needs
-      for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
-        auto& dp_pages = dp_group_pages_[dp_rank];
-
-        size_t current_reserved = dp_pages.reserved_virt_page_list.size();
-        size_t to_reserve = 0;
-        if (current_reserved < static_cast<size_t>(min_reserved_pages_)) {
-          to_reserve = min_reserved_pages_ - current_reserved;
-        }
-
-        // Limit by available free virtual pages
-        to_reserve = std::min(to_reserve, dp_pages.free_virt_page_list.size());
-
-        // Limit by available physical pages (shared resource)
-        size_t max_by_phy = num_free_phy_pages_ / phy_pages_per_virt_page_;
-        to_reserve = std::min(to_reserve, max_by_phy);
-
-        if (to_reserve == 0) {
+      // Check each model for preallocation needs
+      for (auto& [model_id, state] : model_states_) {
+        // Skip sleeping models
+        if (state.is_sleeping) {
           continue;
         }
 
-        // Get pages from free list and consume physical pages
-        std::vector<int64_t> pages_to_reserve;
-        for (size_t i = 0;
-             i < to_reserve && !dp_pages.free_virt_page_list.empty();
-             ++i) {
-          pages_to_reserve.push_back(dp_pages.free_virt_page_list.front());
-          dp_pages.free_virt_page_list.pop_front();
+        // Check each DP group for preallocation needs
+        for (int32_t dp_rank = 0; dp_rank < dp_size_; ++dp_rank) {
+          auto& dp_pages = state.dp_group_pages[dp_rank];
+
+          size_t current_reserved = dp_pages.reserved_virt_page_list.size();
+          size_t to_reserve = 0;
+          if (current_reserved < static_cast<size_t>(min_reserved_pages_)) {
+            to_reserve = min_reserved_pages_ - current_reserved;
+          }
+
+          // Limit by available free virtual pages
+          to_reserve =
+              std::min(to_reserve, dp_pages.free_virt_page_list.size());
+
+          // Limit by available physical pages (shared resource)
+          size_t max_by_phy =
+              num_free_phy_pages_ / state.phy_pages_per_virt_page;
+          to_reserve = std::min(to_reserve, max_by_phy);
+
+          if (to_reserve == 0) {
+            continue;
+          }
+
+          // Get pages from free list and consume physical pages
+          std::vector<int64_t> pages_to_reserve;
+          for (size_t i = 0;
+               i < to_reserve && !dp_pages.free_virt_page_list.empty();
+               ++i) {
+            pages_to_reserve.push_back(dp_pages.free_virt_page_list.front());
+            dp_pages.free_virt_page_list.pop_front();
+          }
+          if (!consume_phy_pages(pages_to_reserve.size() *
+                                 state.phy_pages_per_virt_page)) {
+            // Rollback: put pages back to free list
+            for (auto it = pages_to_reserve.rbegin();
+                 it != pages_to_reserve.rend();
+                 ++it) {
+              dp_pages.free_virt_page_list.push_front(*it);
+            }
+            continue;  // Skip this model/dp_rank
+          }
+          model_dp_pages_to_reserve.emplace_back(
+              model_id, dp_rank, std::move(pages_to_reserve));
         }
-        consume_phy_pages(pages_to_reserve.size());
-        dp_pages_to_reserve.emplace_back(dp_rank, std::move(pages_to_reserve));
       }
     }
 
-    // Map pages for each DP group
-    for (auto& [dp_rank, pages_to_reserve] : dp_pages_to_reserve) {
+    // Map pages for each model and DP group
+    for (auto& [model_id, dp_rank, pages_to_reserve] :
+         model_dp_pages_to_reserve) {
       if (pages_to_reserve.empty()) {
         continue;
       }
 
-      auto& dp_pages = dp_group_pages_[dp_rank];
+      // Check if model went to sleep before mapping, and increment pending ops
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = model_states_.find(model_id);
+        if (it == model_states_.end() || it->second.is_sleeping) {
+          // Model was unregistered or went to sleep, return pages and skip
+          if (it != model_states_.end()) {
+            auto& dp_pages = it->second.dp_group_pages[dp_rank];
+            for (auto pg_it = pages_to_reserve.rbegin();
+                 pg_it != pages_to_reserve.rend();
+                 ++pg_it) {
+              dp_pages.free_virt_page_list.push_front(*pg_it);
+            }
+            release_phy_pages(pages_to_reserve.size() *
+                              it->second.phy_pages_per_virt_page);
+          }
+          continue;
+        }
+        // Increment pending ops before mapping
+        it->second.pending_map_ops.fetch_add(1);
+      }
 
-      try {
-        map_virt_pages(dp_rank, pages_to_reserve);
-        {
-          std::lock_guard<std::mutex> lock(mtx_);
+      bool map_success = map_virt_pages(dp_rank, pages_to_reserve);
+
+      // Decrement pending ops and handle result
+      {
+        std::lock_guard<std::mutex> lock(mtx_);
+        auto it = model_states_.find(model_id);
+        if (it != model_states_.end()) {
+          it->second.pending_map_ops.fetch_sub(1);
+          cond_.notify_all();  // Notify sleep_model if waiting
+        }
+
+        if (!map_success) {
+          // If mapping fails, return pages to free list and release phy pages
+          if (it != model_states_.end()) {
+            auto& dp_pages = it->second.dp_group_pages[dp_rank];
+            for (auto pg_it = pages_to_reserve.rbegin();
+                 pg_it != pages_to_reserve.rend();
+                 ++pg_it) {
+              dp_pages.free_virt_page_list.push_front(*pg_it);
+            }
+            release_phy_pages(pages_to_reserve.size() *
+                              it->second.phy_pages_per_virt_page);
+          }
+          LOG(ERROR) << "Failed to preallocate " << pages_to_reserve.size()
+                     << " virtual pages for model=" << model_id
+                     << " dp_rank=" << dp_rank;
+          continue;
+        }
+
+        // Mapping succeeded, update reserved list
+        if (it != model_states_.end() && !it->second.is_sleeping) {
+          auto& dp_pages = it->second.dp_group_pages[dp_rank];
           for (int64_t virt_page_id : pages_to_reserve) {
             dp_pages.reserved_virt_page_list.push_back(virt_page_id);
           }
           update_memory_usage();
-          cond_.notify_all();
+        } else {
+          // Model went to sleep or was unregistered, release pages
+          if (it != model_states_.end()) {
+            release_phy_pages(pages_to_reserve.size() *
+                              it->second.phy_pages_per_virt_page);
+          }
         }
-        VLOG(1) << "Preallocated " << pages_to_reserve.size()
-                << " virtual pages for dp_rank=" << dp_rank
-                << ", reserved=" << dp_pages.reserved_virt_page_list.size();
-      } catch (const std::exception& e) {
-        // If mapping fails, return pages to free list and release phy pages
-        std::lock_guard<std::mutex> lock(mtx_);
-        for (auto it = pages_to_reserve.rbegin(); it != pages_to_reserve.rend();
-             ++it) {
-          dp_pages.free_virt_page_list.push_front(*it);
-        }
-        release_phy_pages(pages_to_reserve.size());
-        cond_.notify_all();
-        LOG(ERROR) << "Failed to preallocate " << pages_to_reserve.size()
-                   << " virtual pages for dp_rank=" << dp_rank << ": "
-                   << e.what();
       }
+      VLOG(1) << "Preallocated " << pages_to_reserve.size()
+              << " virtual pages for model=" << model_id
+              << " dp_rank=" << dp_rank;
     }
   }
 }
@@ -549,7 +884,7 @@ void PageAllocator::trigger_preallocation() {
   cond_.notify_all();
 }
 
-void PageAllocator::map_virt_pages(int32_t dp_rank,
+bool PageAllocator::map_virt_pages(int32_t dp_rank,
                                    const std::vector<int64_t>& virt_page_ids) {
   // Convert virtual page IDs to offsets (for single-layer XTensor)
   std::vector<offset_t> offsets;
@@ -561,10 +896,15 @@ void PageAllocator::map_virt_pages(int32_t dp_rank,
 
   // Broadcast to workers in this DP group
   auto& allocator = XTensorAllocator::get_instance();
-  allocator.broadcast_map_to_kv_tensors(dp_rank, offsets);
+  if (!allocator.broadcast_map_to_kv_tensors(dp_rank, offsets)) {
+    LOG(ERROR) << "Failed to broadcast map_to_kv_tensors for dp_rank="
+               << dp_rank;
+    return false;
+  }
+  return true;
 }
 
-void PageAllocator::unmap_virt_pages(
+bool PageAllocator::unmap_virt_pages(
     int32_t dp_rank,
     const std::vector<int64_t>& virt_page_ids) {
   // Convert virtual page IDs to offsets (for single-layer XTensor)
@@ -577,7 +917,12 @@ void PageAllocator::unmap_virt_pages(
 
   // Broadcast to workers in this DP group
   auto& allocator = XTensorAllocator::get_instance();
-  allocator.broadcast_unmap_from_kv_tensors(dp_rank, offsets);
+  if (!allocator.broadcast_unmap_from_kv_tensors(dp_rank, offsets)) {
+    LOG(ERROR) << "Failed to broadcast unmap_from_kv_tensors for dp_rank="
+               << dp_rank;
+    return false;
+  }
+  return true;
 }
 
 void PageAllocator::update_memory_usage() {
@@ -589,7 +934,8 @@ void PageAllocator::update_memory_usage() {
 
   VLOG(2) << "Memory usage: "
           << "dp_size=" << dp_size_ << ", free_phy_pages=" << free_phy_pages
-          << ", used_phy_mem=" << used_phy_mem / (1024 * 1024) << "MB";
+          << ", used_phy_mem=" << used_phy_mem / (1024 * 1024) << "MB"
+          << ", num_models=" << model_states_.size();
 }
 
 }  // namespace xllm

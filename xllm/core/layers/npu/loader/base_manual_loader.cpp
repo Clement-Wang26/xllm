@@ -39,6 +39,21 @@ BaseManualLoader::~BaseManualLoader() {
   release_device_storage();
 }
 
+void BaseManualLoader::offload_weights() { release_device_storage(); }
+
+void BaseManualLoader::reload_weights() {
+  if (device_storage_) {
+    LOG(ERROR) << "Device storage already allocated.";
+    return;
+  }
+  auto ret = aclrtMallocAlign32(
+      &device_storage_, storage_size_, ACL_MEM_MALLOC_HUGE_FIRST);
+  CHECK_EQ(ret, ACL_SUCCESS)
+      << "Failed to allocate contiguous device storage size=" << storage_size_;
+  copy_weights_to_device_async();
+  init_device_at_weights();
+}
+
 void BaseManualLoader::init_weight_slices() {
   weight_slices_.resize(weight_count_);
   size_t offset = 0;

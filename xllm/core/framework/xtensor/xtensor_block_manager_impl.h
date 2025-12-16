@@ -51,7 +51,8 @@ class XTensorBlockManagerImpl : public BlockManager {
                                    int64_t num_layers,
                                    size_t block_mem_size,
                                    size_t page_size,
-                                   int32_t dp_rank = 0);
+                                   int32_t dp_rank = 0,
+                                   const std::string& model_id = "");
   ~XTensorBlockManagerImpl() override;
 
   // Allocate num_blocks blocks
@@ -133,6 +134,9 @@ class XTensorBlockManagerImpl : public BlockManager {
   size_t available_size_internal() const;
 
  private:
+  // Model ID (from options_.model_id())
+  std::string model_id_;
+
   // Data parallel rank
   int32_t dp_rank_;
 

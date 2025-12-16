@@ -162,7 +162,6 @@ Qwen2DecoderManualLoader::Qwen2DecoderManualLoader(uint64_t weight_count,
     : BaseManualLoader(weight_count, context) {
   auto options = context.get_tensor_options();
   device_id_ = options.device().index();
-
   for (int i = 0; i < weight_count; ++i) {
     at_weight_tensors_[i] = torch::zeros({1}).to(options);
   }

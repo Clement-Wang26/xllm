@@ -429,31 +429,6 @@ std::vector<torch::Tensor> XTensorAllocator::create_kv_tensors_impl_(
   return create_tensors_internal_(size, dims, dtype, num_layers, tensors_out);
 }
 
-torch::Tensor XTensorAllocator::create_model_weight_tensor(size_t size) {
-  std::lock_guard<std::mutex> lock(mtx_);
-
-  size_t page_size = FLAGS_phy_page_granularity_size;
-  // Ensure size is aligned to page size
-  size_t aligned_size = size;
-  if (size % page_size != 0) {
-    aligned_size = ((size + page_size - 1) / page_size) * page_size;
-    LOG(WARNING) << "Weight tensor size " << size
-                 << " is not aligned to page size " << page_size
-                 << ", aligning to " << aligned_size;
-  }
-
-  // Get zero page from pool if not exists
-  if (!zero_page_) {
-    zero_page_ = PhyPagePool::get_instance().get_zero_page();
-  }
-
-  // Create the weight tensor
-  weight_tensor_ =
-      std::make_unique<XTensor>(aligned_size, torch::kByte, dev_, zero_page_);
-
-  return weight_tensor_->to_torch_tensor();
-}
-
 bool XTensorAllocator::map_to_kv_tensors(const std::vector<offset_t>& offsets) {
   std::unique_lock<std::mutex> lock(mtx_);
 

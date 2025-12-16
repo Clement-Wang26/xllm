@@ -147,6 +147,31 @@ class BaseLayer : public torch::nn::Module {
     }
   };
 
+  virtual void offload_weights() {
+    if (loader_) {
+      loader_->offload_weights();
+    }
+  };
+
+  virtual void reload_weights() {
+    if (loader_) {
+      c10_npu::NPUCachingAllocator::emptyCache();
+      loader_->reload_weights();
+      auto& at_weight_tensors = loader_->get_at_weight_tensors();
+      for (int i = 0; i < atb_weight_tensors_.size(); i++) {
+        atb_weight_tensors_[i] =
+            atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+      }
+    }
+  };
+
+  virtual void merge_and_move_pinned_host() {
+    if (loader_) {
+      loader_->merge_and_move_pinned_host();
+      init_layer();
+    }
+  };
+
   virtual int64_t init_layer() { return 0; };
 
   virtual void run_task(std::string taskName, std::function<int()> task) const;

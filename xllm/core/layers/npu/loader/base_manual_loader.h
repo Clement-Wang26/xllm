@@ -40,6 +40,10 @@ class BaseManualLoader : public BaseLoader {
 
   virtual void merge_loaded_weights() override;
 
+  virtual void offload_weights() override;
+
+  virtual void reload_weights() override;
+
  protected:
   struct WeightSlice {
     uint64_t offset = 0;

@@ -33,20 +33,32 @@ XllmServer::~XllmServer() {
 
 bool XllmServer::start(std::unique_ptr<APIService> service) {
   server_ = std::make_unique<brpc::Server>();
-  if (server_->AddService(service.get(),
-                          brpc::SERVER_DOESNT_OWN_SERVICE,
-                          "v1/completions => CompletionsHttp,"
-                          "v1/chat/completions => ChatCompletionsHttp,"
-                          "v1/embeddings => EmbeddingsHttp,"
-                          "v1/models => ModelsHttp,"
-                          "v1/image/generation => ImageGenerationHttp,"
-                          "v1/rerank => RerankHttp,"
-                          "get_cache_info => GetCacheInfo,"
-                          "link_cluster => LinkCluster,"
-                          "unlink_cluster => UnlinkCluster,"
-                          "v2/repository/index => ModelVersionsHttp,") != 0) {
-    LOG(ERROR) << "Fail to add api service";
-    return false;
+  if (FLAGS_node_rank == 0) {
+    if (server_->AddService(service.get(),
+                            brpc::SERVER_DOESNT_OWN_SERVICE,
+                            "v1/completions => CompletionsHttp,"
+                            "v1/chat/completions => ChatCompletionsHttp,"
+                            "v1/embeddings => EmbeddingsHttp,"
+                            "v1/models => ModelsHttp,"
+                            "v1/image/generation => ImageGenerationHttp,"
+                            "v1/rerank => RerankHttp,"
+                            "get_cache_info => GetCacheInfo,"
+                            "link_cluster => LinkCluster,"
+                            "unlink_cluster => UnlinkCluster,"
+                            "v2/repository/index => ModelVersionsHttp,"
+                            "fork_master => ForkMasterHttp,"
+                            "sleep => SleepHttp,"
+                            "wakeup => WakeupHttp") != 0) {
+      LOG(ERROR) << "Fail to add api service";
+      return false;
+    }
+  } else {
+    if (server_->AddService(service.get(),
+                            brpc::SERVER_DOESNT_OWN_SERVICE,
+                            "fork_master => ForkMasterHttp") != 0) {
+      LOG(ERROR) << "Fail to add api service";
+      return false;
+    }
   }
 
   brpc::ServerOptions options;

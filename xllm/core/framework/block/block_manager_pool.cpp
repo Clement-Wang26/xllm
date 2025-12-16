@@ -51,7 +51,8 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
                                                     options_.num_layers(),
                                                     block_mem_size,
                                                     page_size,
-                                                    /*dp_rank=*/i));
+                                                    /*dp_rank=*/i,
+                                                    options_.model_id()));
     } else if (options.enable_disagg_pd() || options_.enable_kvcache_store()) {
       block_managers_.emplace_back(
           std::make_unique<ConcurrentBlockManagerImpl>(block_options));

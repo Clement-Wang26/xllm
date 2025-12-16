@@ -34,15 +34,10 @@ using offset_t = page_id_t;
 /* NOTE: XTensorAllocator is thread-safe but XTensor is not. */
 class XTensor {
  public:
-  // page_size: logical page size for this XTensor (e.g., 320MB for contiguous)
-  //            if 0, uses FLAGS_phy_page_granularity_size
-  // Physical pages from PhyPagePool are always FLAGS_phy_page_granularity_size.
-  // One logical page may require multiple physical pages.
   XTensor(size_t size,
           torch::Dtype dtype,
           torch::Device dev,
-          PhyPage* zero_page,
-          size_t page_size = 0);
+          PhyPage* zero_page);
   ~XTensor();
 
   bool map(offset_t offset);
@@ -87,21 +82,18 @@ class XTensor {
   inline VirPtr get_base_ptr() const noexcept { return vaddr_; }
 
  private:
-  // Map a single physical page at the given offset (phy_page_size granularity)
+  // Map a single physical page at the given offset
   bool map_phy_page_(PhyPage* page, offset_t offset);
   bool init_with_zero_();
 
   VirPtr vaddr_;
   size_t size_;
-  size_t page_size_;  // Logical page size for this XTensor
-  size_t
-      phy_page_size_;  // Physical page size (FLAGS_phy_page_granularity_size)
+  size_t page_size_;  // Page size (FLAGS_phy_page_granularity_size)
   torch::Dtype dtype_;
   torch::Device dev_;
   PhyPage* zero_page_;  // Not owned, managed by PhyPagePool
 
-  // Maps physical page id -> PhyPage
-  // Physical page id = offset / phy_page_size_
+  // Maps page id -> PhyPage (page id = offset / page_size_)
   std::unordered_map<page_id_t, std::unique_ptr<PhyPage>> mapping_;
 
   // Bump allocator offset for weight allocation

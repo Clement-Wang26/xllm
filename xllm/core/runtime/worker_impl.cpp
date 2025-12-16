@@ -36,6 +36,7 @@ limitations under the License.
 #include "common/device_monitor.h"
 #include "common/global_flags.h"
 #include "common/metrics.h"
+#include "core/distributed_runtime/master.h"
 #include "framework/kv_cache/kv_cache.h"
 #include "framework/model/model_input_params.h"
 #include "framework/model_loader.h"
@@ -103,11 +104,7 @@ bool WorkerImpl::allocate_kv_cache(
         allocator.create_v_tensors(kv_cache_shape[1], dtype_, num_layers);
 
     for (int64_t i = 0; i < num_layers; ++i) {
-      auto k_tensor =
-          at_npu::native::npu_format_cast(k_tensors[i], ACL_FORMAT_ND);
-      auto v_tensor =
-          at_npu::native::npu_format_cast(v_tensors[i], ACL_FORMAT_ND);
-      kv_caches_.emplace_back(k_tensor, v_tensor);
+      kv_caches_.emplace_back(k_tensors[i], v_tensors[i]);
     }
   } else {
     // Original mode: create torch::empty tensors
@@ -142,7 +139,6 @@ bool WorkerImpl::allocate_kv_cache(
 }
 
 bool WorkerImpl::allocate_kv_cache_with_transfer(
-    uint64_t kv_cache_size,
     const std::vector<std::vector<int64_t>>& kv_cache_shape) {
 #if defined(USE_NPU)
   CHECK(model_ != nullptr) << "Model is not initialized.";
@@ -467,29 +463,56 @@ folly::SemiFuture<folly::Unit> WorkerImpl::process_group_test_async() {
   return future;
 }
 
-// initialize model, cache manager. async call
 folly::SemiFuture<bool> WorkerImpl::init_model_async(
     const std::string& model_weights_path,
-    int32_t random_seed) {
+    int32_t random_seed,
+    int32_t master_status) {
   folly::Promise<bool> promise;
   auto future = promise.getSemiFuture();
   threadpool_.schedule([this,
                         model_weights_path,
                         random_seed,
+                        master_status,
                         promise = std::move(promise)]() mutable {
-    auto status = this->init_model(model_weights_path, random_seed);
+    auto status =
+        this->init_model(model_weights_path, random_seed, master_status);
     promise.setValue(status);
   });
 
   return future;
 }
 
+bool WorkerImpl::sleep(int32_t master_status) {
+  // The memory for kvcache and model weights is released by page
+  // allocate; therefore, weights are only loaded into memory here for the light
+  // sleep scenario (if not loaded before).
+  if (master_status == LIGHT_SLEEP) {
+    auto model_loader = ModelLoader::create(model_weights_path_);
+    model_->lazy_load_model(std::move(model_loader));
+  }
+  return true;
+}
+
+bool WorkerImpl::wakeup(int32_t master_status) {
+  if (master_status == LIGHT_SLEEP) {
+    model_->reload_model_weights();
+  } else {
+    auto model_loader = ModelLoader::create(model_weights_path_);
+    model_->load_model(std::move(model_loader));
+  }
+
+  return true;
+}
+
+// initialize model, cache manager. async call
 bool WorkerImpl::init_model(const std::string& model_weights_path,
-                            int32_t random_seed) {
+                            int32_t random_seed,
+                            int32_t master_status) {
   // set same random seed for all worker
   device_.set_seed(random_seed);
 
   auto model_loader = ModelLoader::create(model_weights_path);
+  model_weights_path_ = std::move(model_weights_path);
   auto tokenizer = model_loader->tokenizer();
   CHECK(tokenizer != nullptr);
 
@@ -543,10 +566,15 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
     return false;
   }
 
-  this->load_model(std::move(model_loader));
+  if (master_status == WAKEUP) {
+    this->load_model(std::move(model_loader));
+  } else if (master_status == LIGHT_SLEEP) {
+    this->lazy_load_model(std::move(model_loader));
+  }
 
   status_ = Status::LOADED;
   if (FLAGS_enable_eplb) {
+    // todo: support xtensor
     int32_t num_layers = args.n_layers() - args.first_k_dense_replace();
     int32_t num_device_experts =
         args.n_routed_experts() / context_.get_parallel_args().world_size() +
@@ -562,6 +590,11 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
 void WorkerImpl::load_model(std::unique_ptr<ModelLoader> loader) {
   CHECK(model_ != nullptr) << "Model is not initialized.";
   model_->load_model(std::move(loader));
+}
+
+void WorkerImpl::lazy_load_model(std::unique_ptr<ModelLoader> loader) {
+  CHECK(model_ != nullptr) << "Model is not initialized.";
+  model_->lazy_load_model(std::move(loader));
 }
 
 folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_async(
@@ -606,22 +639,6 @@ uint32_t WorkerImpl::transfer_kv_blocks(
     Slice<BlockTransferInfo>& block_transfer_info) {
   return hierarchy_kv_cache_transfer_->transfer_kv_blocks(batch_id,
                                                           block_transfer_info);
-}
-
-folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_with_transfer_async(
-    uint64_t kv_cache_size,
-    const std::vector<std::vector<int64_t>>& kv_cache_shape) {
-  folly::Promise<bool> promise;
-  auto future = promise.getSemiFuture();
-  threadpool_.schedule([this,
-                        kv_cache_size,
-                        &kv_cache_shape,
-                        promise = std::move(promise)]() mutable {
-    const bool success =
-        this->allocate_kv_cache_with_transfer(kv_cache_size, kv_cache_shape);
-    promise.setValue(success);
-  });
-  return future;
 }
 
 int64_t WorkerImpl::get_active_activation_memory() {

@@ -50,8 +50,6 @@ class Qwen3DecoderLayerImpl : public BaseLayer {
 
   ~Qwen3DecoderLayerImpl() {};
 
-  virtual void merge_loaded_weights() override;
-
   virtual int64_t init_layer() override;
 
   torch::Tensor forward(torch::Tensor& x,

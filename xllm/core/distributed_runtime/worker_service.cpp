@@ -225,8 +225,8 @@ void WorkerService::InitModel(::google::protobuf::RpcController* controller,
     brpc::ClosureGuard done_guard(done);
     auto model_weights_path = request->model_weights_path();
     auto random_seed = request->random_seed();
-    auto init_future =
-        worker_->init_model_async(model_weights_path, random_seed);
+    auto init_future = worker_->init_model_async(
+        model_weights_path, random_seed, request->master_status());
     bool status = std::move(init_future).get();
     if (!status) {
       response->set_ok(false);
@@ -269,7 +269,7 @@ void WorkerService::ProfileDeviceMemory(
 
 void WorkerService::AllocateKVCache(
     ::google::protobuf::RpcController* controller,
-    const proto::KVCacheShape* request,
+    const proto::AllocateKVCacheRequest* request,
     proto::Status* response,
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, request, response, done]() mutable {
@@ -277,15 +277,19 @@ void WorkerService::AllocateKVCache(
     std::vector<std::vector<int64_t>> kv_cache_shape;
     // Reserve for key, value, and optionally index shape
     kv_cache_shape.reserve(3);
-    kv_cache_shape.emplace_back(std::vector<int64_t>(
-        request->key_shape().begin(), request->key_shape().end()));
-    kv_cache_shape.emplace_back(std::vector<int64_t>(
-        request->value_shape().begin(), request->value_shape().end()));
+    kv_cache_shape.emplace_back(
+        std::vector<int64_t>(request->kv_cache_shape().key_shape().begin(),
+                             request->kv_cache_shape().key_shape().end()));
+    kv_cache_shape.emplace_back(
+        std::vector<int64_t>(request->kv_cache_shape().value_shape().begin(),
+                             request->kv_cache_shape().value_shape().end()));
     // add index shape if exists
-    if (request->index_shape_size() > 0) {
-      kv_cache_shape.emplace_back(std::vector<int64_t>(
-          request->index_shape().begin(), request->index_shape().end()));
+    if (request->kv_cache_shape().index_shape_size() > 0) {
+      kv_cache_shape.emplace_back(
+          std::vector<int64_t>(request->kv_cache_shape().index_shape().begin(),
+                               request->kv_cache_shape().index_shape().end()));
     }
+
     auto future = worker_->allocate_kv_cache_async(kv_cache_shape);
     bool status = std::move(future).get();
     response->set_ok(status);
@@ -295,12 +299,11 @@ void WorkerService::AllocateKVCache(
 
 void WorkerService::AllocateKVCacheWithTransfer(
     ::google::protobuf::RpcController* controller,
-    const proto::AllocateKVCacheWithTransferRequest* req,
+    const proto::AllocateKVCacheRequest* req,
     proto::Status* resp,
     ::google::protobuf::Closure* done) {
   threadpool_->schedule([this, controller, req, resp, done]() mutable {
     brpc::ClosureGuard done_guard(done);
-    uint64_t kv_cache_size = req->kv_cache_size();
     std::vector<std::vector<int64_t>> kv_cache_shape;
     kv_cache_shape.reserve(2);
     kv_cache_shape.emplace_back(
@@ -309,8 +312,8 @@ void WorkerService::AllocateKVCacheWithTransfer(
     kv_cache_shape.emplace_back(
         std::vector<int64_t>(req->kv_cache_shape().value_shape().begin(),
                              req->kv_cache_shape().value_shape().end()));
-    auto future = worker_->allocate_kv_cache_with_transfer_async(
-        kv_cache_size, kv_cache_shape);
+    auto future =
+        worker_->allocate_kv_cache_with_transfer_async(kv_cache_shape);
     bool status = std::move(future).get();
     resp->set_ok(status);
   });
@@ -531,6 +534,32 @@ void WorkerService::UnlinkCluster(::google::protobuf::RpcController* controller,
         worker_->unlink_cluster(cluster_ids, addrs, device_ips, ports);
     resp->set_ok(status);
   });
+  return;
+}
+
+void WorkerService::Sleep(::google::protobuf::RpcController* controller,
+                          const proto::SleepRequest* req,
+                          proto::Status* resp,
+                          ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->sleep(req->master_status());
+    resp->set_ok(status);
+  });
+
+  return;
+}
+
+void WorkerService::Wakeup(::google::protobuf::RpcController* controller,
+                           const proto::WakeupRequest* req,
+                           proto::Status* resp,
+                           ::google::protobuf::Closure* done) {
+  threadpool_->schedule([this, controller, req, resp, done]() mutable {
+    brpc::ClosureGuard done_guard(done);
+    bool status = worker_->wakeup(req->master_status());
+    resp->set_ok(status);
+  });
+
   return;
 }
 

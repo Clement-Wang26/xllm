@@ -66,8 +66,6 @@ class XTensorAllocator {
   std::vector<torch::Tensor> create_v_tensors(const std::vector<int64_t>& dims,
                                               torch::Dtype dtype,
                                               int64_t num_layers);
-  // Model weights interfaces.
-  torch::Tensor create_model_weight_tensor(size_t size);
 
   // KV tensor operations (partial mapping by offsets)
   // KV XTensor is created on first map if not exists

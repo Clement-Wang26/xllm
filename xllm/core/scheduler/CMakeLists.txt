@@ -51,7 +51,14 @@ cc_test(
     continuous_scheduler_test.cpp
   DEPS
     :scheduler
+    :xllm_server
     GTest::gtest_main
     $<$<BOOL:${USE_NPU}>:nnopbase>
 )
+
+target_link_libraries(chunked_prefill_scheduler_test
+                      PUBLIC
+                      Python::Python
+                      $<$<BOOL:${USE_NPU}>:ascendcl>
+                      $<$<BOOL:${USE_NPU}>:hccl>)
 

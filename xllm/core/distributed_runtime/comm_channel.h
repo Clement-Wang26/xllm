@@ -42,9 +42,6 @@ class CommChannel {
   virtual bool allocate_kv_cache(
       const std::vector<std::vector<int64_t>>& kv_cache_shape);
 
-  virtual bool allocate_continuous_kv_cache(
-      const std::vector<XTensor::Options>& options);
-
   virtual bool get_device_info(std::string& device_ip, uint16_t& port);
 
   virtual bool get_cache_info(uint64_t& cluster_id,

@@ -74,11 +74,6 @@ bool RemoteWorker::allocate_kv_cache(
   return channel_->allocate_kv_cache(kv_cache_shape);
 }
 
-bool RemoteWorker::allocate_continuous_kv_cache(
-    const std::vector<XTensor::Options>& options) {
-  return channel_->allocate_continuous_kv_cache(options);
-}
-
 void RemoteWorker::get_device_info(std::string& device_ip, uint16_t& port) {
   channel_->get_device_info(device_ip, port);
 }
@@ -218,21 +213,6 @@ folly::SemiFuture<bool> RemoteWorker::allocate_kv_cache_async(
           promise.setValue(true);
         }
       });
-  return future;
-}
-
-folly::SemiFuture<bool> RemoteWorker::allocate_continuous_kv_cache_async(
-    const std::vector<XTensor::Options>& options) {
-  folly::Promise<bool> promise;
-  auto future = promise.getSemiFuture();
-  threadpool_.schedule([this, options, promise = std::move(promise)]() mutable {
-    if (!channel_->allocate_continuous_kv_cache(options)) {
-      LOG(ERROR) << "allocate_continuous_kv_cache_async failed";
-      promise.setValue(false);
-    } else {
-      promise.setValue(true);
-    }
-  });
   return future;
 }
 

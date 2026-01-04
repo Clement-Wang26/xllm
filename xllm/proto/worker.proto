@@ -33,18 +33,6 @@ message KVCacheShape {
   repeated int64 index_shape = 3;
 }
 
-message XTensorOptions {
-  int64 num_kv_heads = 1;
-  int64 head_size = 2;
-  int32 max_context_len = 3;
-  int32 max_seqs_per_batch = 4;
-}
-
-message XTensorOptionsVec{
-  XTensorOptions key_options = 1;
-  XTensorOptions value_options = 2;
-}
-
 message AllocateKVCacheWithTransferRequest {
   uint64 kv_cache_size = 1;
   KVCacheShape kv_cache_shape = 2;
@@ -211,9 +199,6 @@ message ForwardInput {
   repeated int32 src_block_indices = 32;
   repeated int32 dst_block_indices = 33;
   repeated int32 cum_sum = 34;
-  // for continuous kvcache
-  repeated int64 new_cache_slot_offsets = 35;
-  repeated int64 kv_cache_start_offsets = 36;
   // beam search kernel
   repeated float acc_logprob_vec = 37;
   uint64 batch_id = 38;
@@ -266,7 +251,6 @@ service DistributeWorker {
   rpc ProcessGroupTest (Empty) returns (Status);
   rpc ProfileDeviceMemory (Empty) returns (DeviceMemory);
   rpc AllocateKVCache (KVCacheShape) returns (Status);
-  rpc AllocateContinuousKVCache (XTensorOptionsVec) returns (Status);
   rpc AllocateKVCacheWithTransfer(AllocateKVCacheWithTransferRequest) returns (Status) {}
   rpc PullKVCache(PullKVCacheRequest) returns (Status) {}
   rpc GetDeviceInfo(Empty) returns (DeviceInfo) {}

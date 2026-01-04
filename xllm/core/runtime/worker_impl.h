@@ -85,9 +85,6 @@ class WorkerImpl {
       const std::vector<std::vector<int64_t>>& kv_cache_shape);
 #endif
 
-  virtual bool allocate_continuous_kv_cache(
-      const std::vector<XTensor::Options>& options);
-
   virtual void get_device_info(std::string& device_ip, uint16_t& port);
 
   virtual void get_cache_info(uint64_t& cluster_id,
@@ -133,9 +130,6 @@ class WorkerImpl {
   virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
       uint64_t kv_cache_size,
       const std::vector<std::vector<int64_t>>& kv_cache_shape);
-
-  virtual folly::SemiFuture<bool> allocate_continuous_kv_cache_async(
-      const std::vector<XTensor::Options>& options);
 
   virtual folly::SemiFuture<bool> pull_kv_blocks_async(
       uint64_t src_cluster_id,

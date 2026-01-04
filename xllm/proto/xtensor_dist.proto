@@ -1,0 +1,53 @@
+syntax = "proto3";
+
+option go_package = "jd.com/jd-infer/xllm;xllm";
+package xllm.proto;
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+import "common.proto";
+
+// Request for KV tensor mapping with offsets
+message OffsetsRequest {
+  repeated uint64 offsets = 1;
+}
+
+// Response for memory info query
+// Returns 0 for both fields on failure
+message MemoryInfoResponse {
+  int64 available_memory = 1;  // Available memory in bytes
+  int64 total_memory = 2;      // Total memory in bytes
+}
+
+// Request for initializing PhyPagePool
+message InitPhyPagePoolRequest {
+  int64 num_pages = 1;  // Number of physical pages to allocate
+}
+
+// Request for weight tensor mapping
+message MapWeightTensorRequest {
+  int64 num_pages = 1;  // Number of physical pages (aligned from weight size)
+}
+
+// XTensorDist service for distributed XTensor mapping operations
+service XTensorDist {
+  rpc Hello (Status) returns (Status);
+  
+  // Memory info query (called before init to get available memory)
+  rpc GetMemoryInfo (Status) returns (MemoryInfoResponse);
+  
+  // Initialize PhyPagePool with specified number of pages
+  rpc InitPhyPagePool (InitPhyPagePoolRequest) returns (Status);
+  
+  // KV tensor operations (partial mapping by offsets)
+  // KV XTensor is created on first map if not exists
+  // Size = PhyPagePool::num_total() * page_size
+  rpc MapToKvTensors (OffsetsRequest) returns (Status);
+  rpc UnmapFromKvTensors (OffsetsRequest) returns (Status);
+  
+  // Weight tensor operations (full tensor mapping)
+  // Weight XTensor is created on first map if not exists
+  rpc MapWeightTensor (MapWeightTensorRequest) returns (Status);
+  rpc UnmapWeightTensor (Status) returns (Status);
+}
+

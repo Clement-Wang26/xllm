@@ -18,5 +18,6 @@ proto_library(
     xllm_service.proto
     xservice.proto
     image_generation.proto
-    xtensor_manager.proto
+    xtensor_dist.proto
+
 )

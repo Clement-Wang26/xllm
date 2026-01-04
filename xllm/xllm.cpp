@@ -30,6 +30,9 @@ limitations under the License.
 #include "core/common/options.h"
 #include "core/common/types.h"
 #include "core/distributed_runtime/master.h"
+#include "core/framework/xtensor/options.h"
+#include "core/framework/xtensor/xtensor_allocator.h"
+#include "core/util/device_name_utils.h"
 #include "core/util/json_reader.h"
 #include "core/util/net.h"
 #include "core/util/utils.h"
@@ -230,11 +233,40 @@ int run() {
       .max_global_ttft_ms(FLAGS_max_global_ttft_ms)
       .max_global_tpot_ms(FLAGS_max_global_tpot_ms)
       .max_requests_per_batch(FLAGS_max_requests_per_batch)
-      .enable_continuous_kvcache(FLAGS_enable_continuous_kvcache)
       .enable_shm(FLAGS_enable_shm)
       .is_local(is_local);
 
   InstanceName::name()->set_name(options.instance_name().value_or(""));
+
+  // master node
+  // init XTensor allocator and PhyPagePool for xtensor mode
+  if (FLAGS_enable_xtensor) {
+    // Parse devices
+    const auto devices =
+        DeviceNameUtils::parse_devices(options.devices().value_or("auto"));
+
+    // Initialize XTensorAllocator with first device
+    auto& allocator = XTensorAllocator::get_instance();
+    allocator.init(devices[0]);
+
+    // Setup distributed XTensor service for multi-GPU/multi-node
+    if (FLAGS_nnodes > 1) {
+      xtensor::Options xtensor_options;
+      xtensor_options.devices(devices)
+          .nnodes(FLAGS_nnodes)
+          .node_rank(FLAGS_node_rank);
+      allocator.setup_multi_node_xtensor_dist(
+          xtensor_options, FLAGS_xtensor_master_node_addr, FLAGS_dp_size);
+    }
+
+    // Initialize PhyPagePool on all workers
+    int64_t num_pages = allocator.init_phy_page_pools(
+        FLAGS_max_memory_utilization, FLAGS_max_cache_size);
+    if (num_pages <= 0) {
+      LOG(FATAL) << "Failed to initialize PhyPagePool";
+    }
+    LOG(INFO) << "XTensor initialized with " << num_pages << " physical pages";
+  }
 
   // working node
   if (options.node_rank() != 0) {
@@ -247,7 +279,6 @@ int run() {
     }
   }
 
-  // master node
   auto master = create_master(FLAGS_backend, options);
   master->run();
 

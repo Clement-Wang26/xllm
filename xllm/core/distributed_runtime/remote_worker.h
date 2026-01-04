@@ -54,9 +54,6 @@ class RemoteWorker : public WorkerClient {
   virtual bool allocate_kv_cache(
       const std::vector<std::vector<int64_t>>& kv_cache_shape) override;
 
-  virtual bool allocate_continuous_kv_cache(
-      const std::vector<XTensor::Options>& options) override;
-
   virtual void get_device_info(std::string& device_ip, uint16_t& port);
 
   virtual void get_cache_info(uint64_t& cluster_id,
@@ -96,9 +93,6 @@ class RemoteWorker : public WorkerClient {
 
   virtual folly::SemiFuture<bool> allocate_kv_cache_async(
       const std::vector<std::vector<int64_t>>& kv_cache_shape) override;
-
-  virtual folly::SemiFuture<bool> allocate_continuous_kv_cache_async(
-      const std::vector<XTensor::Options>& options) override;
 
   virtual folly::SemiFuture<bool> allocate_kv_cache_with_transfer_async(
       const uint64_t kv_cache_size,

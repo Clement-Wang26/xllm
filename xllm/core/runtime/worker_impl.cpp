@@ -41,7 +41,7 @@ limitations under the License.
 #include "framework/model_loader.h"
 #include "framework/sampling/sampler.h"
 #include "framework/state_dict/state_dict.h"
-#include "framework/xtensor/multi_layer_xtensor_transfer.h"
+#include "framework/xtensor/xtensor_allocator.h"
 #include "util/net.h"
 #include "util/tensor_helper.h"
 #include "util/threadpool.h"
@@ -91,63 +91,52 @@ bool WorkerImpl::allocate_kv_cache(
   const bool enable_lighting_indexer =
       context_.get_model_args().index_n_heads() > 0;
   kv_caches_.reserve(num_layers);
-  for (int64_t i = 0; i < num_layers; ++i) {
-    torch::Tensor key_cache, value_cache, index_cache;
+
+  if (FLAGS_enable_xtensor) {
+    // XTensor mode: create xtensor-backed KV cache
+    auto& allocator = XTensorAllocator::get_instance();
+    // Create K tensors for all layers
+    auto k_tensors =
+        allocator.create_k_tensors(kv_cache_shape[0], dtype_, num_layers);
+    // Create V tensors for all layers
+    auto v_tensors =
+        allocator.create_v_tensors(kv_cache_shape[1], dtype_, num_layers);
+
+    for (int64_t i = 0; i < num_layers; ++i) {
+      auto k_tensor =
+          at_npu::native::npu_format_cast(k_tensors[i], ACL_FORMAT_ND);
+      auto v_tensor =
+          at_npu::native::npu_format_cast(v_tensors[i], ACL_FORMAT_ND);
+      kv_caches_.emplace_back(k_tensor, v_tensor);
+    }
+  } else {
+    // Original mode: create torch::empty tensors
+    for (int64_t i = 0; i < num_layers; ++i) {
+      torch::Tensor key_cache, value_cache, index_cache;
 #if defined(USE_NPU)
-    key_cache = at_npu::native::npu_format_cast(
-        torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_)),
-        2);
-    value_cache = at_npu::native::npu_format_cast(
-        torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_)),
-        2);
+      key_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_)),
+          2);
+      value_cache = at_npu::native::npu_format_cast(
+          torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_)),
+          2);
 #else
-    key_cache =
-        torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
-    if (!kv_cache_shape[1].empty()) {
-      value_cache =
-          torch::empty(kv_cache_shape[1], torch::dtype(dtype_).device(device_));
-    }
-    if (enable_lighting_indexer) {
-      index_cache =
-          torch::empty(kv_cache_shape[2], torch::dtype(dtype_).device(device_));
-    }
+      key_cache =
+          torch::empty(kv_cache_shape[0], torch::dtype(dtype_).device(device_));
+      if (!kv_cache_shape[1].empty()) {
+        value_cache = torch::empty(kv_cache_shape[1],
+                                   torch::dtype(dtype_).device(device_));
+      }
+      if (enable_lighting_indexer) {
+        index_cache = torch::empty(kv_cache_shape[2],
+                                   torch::dtype(dtype_).device(device_));
+      }
 #endif
-    kv_caches_.emplace_back(key_cache, value_cache, index_cache);
+      kv_caches_.emplace_back(key_cache, value_cache, index_cache);
+    }
   }
 
   init_hierarchy_kv_cache_transfer();
-  status_ = Status::READY;
-  return true;
-}
-
-bool WorkerImpl::allocate_continuous_kv_cache(
-    const std::vector<XTensor::Options>& options) {
-  CHECK(model_ != nullptr) << "Model is not initialized.";
-  CHECK(kv_caches_.empty()) << "KV caches are already initialized.";
-
-  // create a KVCache for each layer
-  const int64_t num_layers = context_.get_model_args().n_layers();
-  kv_caches_.reserve(num_layers);
-
-  std::shared_ptr<XTensor> key_xtensor;
-  std::shared_ptr<XTensor> value_xtensor;
-
-  std::vector<std::shared_ptr<XTensor>> key_xtensors(num_layers);
-  std::vector<std::shared_ptr<XTensor>> value_xtensors(num_layers);
-
-  for (int64_t i = 0; i < num_layers; ++i) {
-    key_xtensor = std::make_shared<XTensor>(options[0], dtype_);
-    key_xtensors[i] = key_xtensor;
-
-    value_xtensor = std::make_shared<XTensor>(options[1], dtype_);
-    value_xtensors[i] = value_xtensor;
-
-    kv_caches_.emplace_back(key_xtensor, value_xtensor);
-  }
-
-  MultiLayerXTensorTransfer::get_instance().set_multi_layer_xtensor(
-      key_xtensors, value_xtensors, device_);
-
   status_ = Status::READY;
   return true;
 }
@@ -584,17 +573,6 @@ folly::SemiFuture<bool> WorkerImpl::allocate_kv_cache_async(
         const bool success = this->allocate_kv_cache(kv_cache_shape);
         promise.setValue(success);
       });
-  return future;
-}
-
-folly::SemiFuture<bool> WorkerImpl::allocate_continuous_kv_cache_async(
-    const std::vector<XTensor::Options>& options) {
-  folly::Promise<bool> promise;
-  auto future = promise.getSemiFuture();
-  threadpool_.schedule([this, options, promise = std::move(promise)]() mutable {
-    const bool success = this->allocate_continuous_kv_cache(options);
-    promise.setValue(success);
-  });
   return future;
 }
 

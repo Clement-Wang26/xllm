@@ -260,8 +260,6 @@ void DeepseekV2DecoderLayerImpl::initialize_basic_parameters(
   param.isBF16 = args.dtype() == "bfloat16";
   param.enableSwiGLU = true;
   param.enableLcoc = true;
-  // TODO: modify xllm_atb_layers
-  // param.enableContinuousKvCache = FLAGS_enable_continuous_kvcache;
 
   param.attnLinearTransposeType = {1, 1, 1, 1, 1, 1};
   param.mlpLinearTransposeType = {1, -1, 1, -1};
@@ -841,21 +839,13 @@ void DeepseekV2DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 8) =
       atb_speed::Utils::AtTensor2Tensor(attn_mask);
 
-  if (!FLAGS_enable_continuous_kvcache) {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
-        atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
-        atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
-  } else {
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
-        XTensor2Tensor(kv_cache.get_k_xtensor());
-    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
-        XTensor2Tensor(kv_cache.get_v_xtensor());
-  }
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 9) =
+      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_k_cache());
+  node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 10) =
+      atb_speed::Utils::AtTensor2Tensor(kv_cache.get_v_cache());
 
-  if ((!input_params.block_tables.defined() ||
-       input_params.block_tables.storage().data() == nullptr) &&
-      !FLAGS_enable_continuous_kvcache) {
+  if (!input_params.block_tables.defined() ||
+      input_params.block_tables.storage().data() == nullptr) {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11) =
         atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 11).hostData =
@@ -876,30 +866,22 @@ void DeepseekV2DecoderLayerImpl::build_node_variant_pack(
   node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 14) =
       atb_speed::Utils::AtTensor2Tensor(tensor_placeholder_);
 
-  if (!FLAGS_enable_continuous_kvcache) {
-    if (!input_params.block_tables.defined() ||
-        input_params.block_tables.storage().data() == nullptr) {
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
-          atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
-          atb_speed::Utils::AtTensor2Tensor(slot_tensor_placeholder_);
-    } else {
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
-          atb_speed::Utils::AtTensor2Tensor(input_params.block_tables);
-      node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
-          atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slots);
-    }
+  if (!input_params.block_tables.defined() ||
+      input_params.block_tables.storage().data() == nullptr) {
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
+        atb_speed::Utils::AtTensor2Tensor(block_tables_placeholder_);
+    node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
+        atb_speed::Utils::AtTensor2Tensor(slot_tensor_placeholder_);
   } else {
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 15) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.kv_cache_start_offsets);
+        atb_speed::Utils::AtTensor2Tensor(input_params.block_tables);
     node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 16) =
-        atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slot_offsets);
+        atb_speed::Utils::AtTensor2Tensor(input_params.new_cache_slots);
   }
 
   if (num_speculative_tokens_ > 0 && !is_prefill) {
-    if ((!input_params.block_tables.defined() ||
-         input_params.block_tables.storage().data() == nullptr) &&
-        !FLAGS_enable_continuous_kvcache) {
+    if (!input_params.block_tables.defined() ||
+        input_params.block_tables.storage().data() == nullptr) {
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17) =
           atb_speed::Utils::AtTensor2Tensor(int_tensor_placeholder_);
       node.variantPack.inTensors.at(WEIGHT_COUNT_PER_LAYER + 17).hostData =

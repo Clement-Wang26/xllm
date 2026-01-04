@@ -176,8 +176,6 @@ class Options {
   // max requests per batch
   PROPERTY(int, max_requests_per_batch) = 0;
 
-  PROPERTY(bool, enable_continuous_kvcache) = false;
-
   // for offline inference: start with offline inference, default is false
   PROPERTY(bool, enable_offline_inference) = false;
   // for offline inference: the path to spawn worker binary

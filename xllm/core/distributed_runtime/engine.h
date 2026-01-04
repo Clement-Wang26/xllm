@@ -22,7 +22,6 @@ limitations under the License.
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
-#include "framework/xtensor/xtensor_manager_pool.h"
 #include "runtime/options.h"
 
 namespace xllm {
@@ -45,14 +44,6 @@ class Engine {
     auto p = reinterpret_cast<BlockManagerPool*>(kv_cache_manager_.get());
     if (!p) {
       LOG(FATAL) << "kv_cache_manager_ is not BlockManagerPool type!";
-    }
-    return p;
-  }
-
-  virtual XTensorManagerPool* xtensor_manager_pool() const {
-    auto p = reinterpret_cast<XTensorManagerPool*>(kv_cache_manager_.get());
-    if (!p) {
-      LOG(FATAL) << "kv_cache_manager_ is not XTensorManagerPool type!";
     }
     return p;
   }

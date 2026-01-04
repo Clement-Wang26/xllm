@@ -111,8 +111,6 @@ class DeepseekV2DecoderLayerImpl : public BaseLayer {
 
   ~DeepseekV2DecoderLayerImpl() {};
 
-  virtual void merge_loaded_weights() override;
-
   torch::Tensor build_expert_routing_map(std::vector<int32_t> expert_lists);
 
   void prepare_expert_weight(const std::vector<int32_t>& expert_list);

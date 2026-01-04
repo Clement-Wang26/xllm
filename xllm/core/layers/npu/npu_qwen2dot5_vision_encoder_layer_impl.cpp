@@ -55,7 +55,6 @@ Qwen2dot5VisionEncoderLayerImpl::Qwen2dot5VisionEncoderLayerImpl(
   auto parallel_args = context.get_parallel_args();
   auto options = context.get_tensor_options();
   param_from_args(encode_param_, model_args, parallel_args);
-  at_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   dtype_ = c10::typeMetaToScalarType(options.dtype());
   device_id_ = options.device().index();

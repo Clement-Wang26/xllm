@@ -142,5 +142,4 @@ inline void save_tensor_as_pickle(const torch::Tensor& tensor,
   ofs.write(pickled.data(), static_cast<std::streamsize>(pickled.size()));
   CHECK(ofs.good()) << "Write failed to: " << file_path;
 }
-
 }  // namespace xllm

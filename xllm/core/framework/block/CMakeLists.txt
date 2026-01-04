@@ -27,6 +27,7 @@ cc_library(
     Boost::serialization
     SMHasherSupport
     torch
+    :xtensor
 )
 target_link_libraries(block PRIVATE Folly::folly)
 

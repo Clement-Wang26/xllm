@@ -53,6 +53,7 @@ cc_test(
     continuous_scheduler_test.cpp
   DEPS
     :scheduler
+    :xllm_server
     GTest::gtest_main
     $<$<BOOL:${USE_NPU}>:nnopbase>
 )

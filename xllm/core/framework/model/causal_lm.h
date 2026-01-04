@@ -75,6 +75,33 @@ struct has_set_word_embedding<
     T,
     std::void_t<decltype(std::declval<T>()->set_word_embedding(
         std::declval<layer::WordEmbedding&>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_lazy_load_model : std::false_type {};
+
+template <typename T>
+struct has_lazy_load_model<
+    T,
+    std::void_t<decltype(std::declval<T>()->lazy_load_model(
+        std::declval<std::unique_ptr<ModelLoader>>()))>> : std::true_type {};
+
+template <typename T, typename = void>
+struct has_offload_model_weights : std::false_type {};
+
+template <typename T>
+struct has_offload_model_weights<
+    T,
+    std::void_t<decltype(std::declval<T>()->offload_model_weights())>>
+    : std::true_type {};
+
+template <typename T, typename = void>
+struct has_reload_model_weights : std::false_type {};
+
+template <typename T>
+struct has_reload_model_weights<
+    T,
+    std::void_t<decltype(std::declval<T>()->reload_model_weights())>>
+    : std::true_type {};
 }  // namespace detail
 #endif
 
@@ -123,10 +150,18 @@ class CausalLM : public torch::nn::Module {
     NOT_IMPLEMENTED();
     return nullptr;
   }
+
   virtual void set_word_embedding(layer::WordEmbedding& embedding) {
     NOT_IMPLEMENTED();
   }
-#endif
+
+  virtual void lazy_load_model(std::unique_ptr<ModelLoader> loader) {
+    NOT_IMPLEMENTED();
+  }
+
+  virtual void offload_model_weights() { NOT_IMPLEMENTED(); }
+
+  virtual void reload_model_weights() { NOT_IMPLEMENTED(); }
 };
 
 template <typename Model>
@@ -150,6 +185,31 @@ class CausalLMImpl : public CausalLM {
   void load_model(std::unique_ptr<ModelLoader> loader) override {
     model_->load_model(std::move(loader));
   }
+
+  void lazy_load_model(std::unique_ptr<ModelLoader> loader) override {
+    if constexpr (detail::has_lazy_load_model<Model>::value) {
+      model_->lazy_load_model(std::move(loader));
+    } else {
+      CausalLM::lazy_load_model(std::move(loader));
+    }
+  }
+
+  void offload_model_weights() override {
+    if constexpr (detail::has_offload_model_weights<Model>::value) {
+      model_->offload_model_weights();
+    } else {
+      CausalLM::offload_model_weights();
+    }
+  }
+
+  void reload_model_weights() override {
+    if constexpr (detail::has_reload_model_weights<Model>::value) {
+      model_->reload_model_weights();
+    } else {
+      CausalLM::reload_model_weights();
+    }
+  }
+
   virtual void prepare_expert_weight(
       int32_t layer_id,
       const std::vector<int32_t>& expert_ids) override {

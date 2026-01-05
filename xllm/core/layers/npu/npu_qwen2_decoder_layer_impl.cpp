@@ -48,13 +48,13 @@ void Qwen2DecoderLayerImpl::param_from_args(
   param.loraEnableGMM = false;
   param.packQuantType = {1, 1};
   param.linearQuantType = {0, -1, -1, 0, 0, -1, 0};
-  param.linearTransposeType = {static_cast<int>(TransposeType::TRANSPOSE),
+  param.linearTransposeType = {static_cast<int>(TransposeType::NOT_TRANSPOSE),
                                static_cast<int>(TransposeType::INVALID),
                                static_cast<int>(TransposeType::INVALID),
-                               static_cast<int>(TransposeType::TRANSPOSE),
-                               static_cast<int>(TransposeType::TRANSPOSE),
+                               static_cast<int>(TransposeType::NOT_TRANSPOSE),
+                               static_cast<int>(TransposeType::NOT_TRANSPOSE),
                                static_cast<int>(TransposeType::INVALID),
-                               static_cast<int>(TransposeType::TRANSPOSE)};
+                               static_cast<int>(TransposeType::NOT_TRANSPOSE)};
   param.kvQuant = false;
   param.quantGroupSize = 0;
   param.rmsNormEps = args.rms_norm_eps();

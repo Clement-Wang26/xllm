@@ -92,6 +92,7 @@ class Qwen2DecoderManualLoader : public BaseManualLoader {
   void verify_loaded_weights() const override;
   void merge_loaded_weights() override;
   void merge_and_move_pinned_host();
+  bool is_nz_format_tensor(int weight_index) override;
 
  protected:
   int device_id_;

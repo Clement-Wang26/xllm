@@ -43,8 +43,11 @@ void BaseManualLoader::offload_weights() { release_host_storage(); }
 
 void BaseManualLoader::reload_weights() {
   if (!device_storage_) {
-    LOG(ERROR) << "Device storage not allocated.";
-    return;
+    auto& allocator = XTensorAllocator::get_instance();
+    bool ok =
+        allocator.allocate_weight(model_id_, device_storage_, storage_size_);
+    CHECK(ok) << "Failed to allocate contiguous device storage size="
+              << storage_size_;
   }
   copy_weights_to_device_async();
   init_device_at_weights();
@@ -92,13 +95,6 @@ void BaseManualLoader::copy_weights_to_pinned_host() {
                 static_cast<ptrdiff_t>(slice.offset);
     std::memcpy(dst, host_tensor.data_ptr(), slice.bytes);
     at_host_weight_tensors_[i] = at::Tensor();
-  }
-  if (!device_storage_) {
-    auto& allocator = XTensorAllocator::get_instance();
-    bool ok =
-        allocator.allocate_weight(model_id_, device_storage_, storage_size_);
-    CHECK(ok) << "Failed to allocate contiguous device storage size="
-              << storage_size_;
   }
 }
 

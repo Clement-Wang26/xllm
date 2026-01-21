@@ -36,6 +36,10 @@ class KVCacheTransfer {
     int64_t dst_v_cache_id;
     std::vector<uint64_t> src_blocks;
     std::vector<uint64_t> dst_blocks;
+
+    // XTensor mode: destination offsets from D-node (per-layer)
+    // dst_xtensor_layer_offsets[layer_id] = {k_offsets, v_offsets}
+    std::vector<XTensorLayerOffsets> dst_xtensor_layer_offsets;
   };
 
   KVCacheTransfer() = default;
@@ -143,7 +147,8 @@ class KVCacheTransferFactory {
       std::vector<xllm::KVCache>& kv_caches,
       int64_t num_layers,
       std::function<void(const std::vector<std::vector<int64_t>>&)>
-          allocate_kv_cache_func);
+          allocate_kv_cache_func,
+      const std::string& model_id = "");
 };
 
 }  // namespace xllm

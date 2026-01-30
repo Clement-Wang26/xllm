@@ -122,6 +122,9 @@ void DisaggPDScheduler::register_instance_info(const std::string& server_name,
   instance_info_.dp_size = options_.dp_size();
 
   engine->get_device_info(instance_info_.device_ips, instance_info_.ports);
+
+  // Set engine for heartbeat to collect XTensor info dynamically
+  xservice_client_->set_engine(engine);
 }
 
 void DisaggPDScheduler::profile_ttft() {

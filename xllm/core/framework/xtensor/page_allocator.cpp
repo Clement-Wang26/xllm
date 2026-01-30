@@ -838,6 +838,17 @@ size_t PageAllocator::get_num_total_phy_pages() const {
   return num_total_phy_pages_;
 }
 
+std::vector<size_t> PageAllocator::get_all_worker_free_pages() const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  std::vector<size_t> result;
+  result.reserve(max_world_size_);
+  for (int32_t i = 0; i < max_world_size_; ++i) {
+    size_t free_pages = num_total_phy_pages_ - worker_pages_used_[i];
+    result.push_back(free_pages);
+  }
+  return result;
+}
+
 int64_t PageAllocator::get_virt_page_id(int64_t block_id,
                                         size_t block_mem_size) const {
   return block_id * block_mem_size / page_size_;

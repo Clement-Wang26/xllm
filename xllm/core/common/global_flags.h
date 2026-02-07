@@ -65,6 +65,20 @@ DECLARE_int32(max_tokens_per_chunk_for_prefill);
 
 DECLARE_int32(num_speculative_tokens);
 
+DECLARE_string(speculative_algorithm);
+
+DECLARE_int32(speculative_suffix_cache_max_depth);
+
+DECLARE_double(speculative_suffix_max_spec_factor);
+
+DECLARE_double(speculative_suffix_max_spec_offset);
+
+DECLARE_double(speculative_suffix_min_token_prob);
+
+DECLARE_int32(speculative_suffix_max_cached_requests);
+
+DECLARE_bool(speculative_suffix_use_tree_spec);
+
 DECLARE_int32(num_request_handling_threads);
 
 DECLARE_int32(num_response_handling_threads);

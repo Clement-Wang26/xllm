@@ -111,6 +111,9 @@ class SpeculativeEngine : public Engine {
   // draft engine
   std::unique_ptr<LLMEngine> draft_engine_;
 
+  // whether suffix speculative decoding uses an external draft engine
+  bool use_draft_engine_ = true;
+
   // whether target and draft engine are sharing the same device
   bool share_device_ = false;
 

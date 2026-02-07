@@ -20,6 +20,7 @@ limitations under the License.
 
 #include <nlohmann/json.hpp>
 #include <optional>
+#include <string>
 
 #include "common/types.h"
 #include "framework/model/model_input_params.h"
@@ -222,6 +223,8 @@ struct RawForwardInput {
   std::vector<int32_t> extra_token_ids;
   // embedding ids of each sequence
   std::vector<int> embedding_ids;
+  // request ids of each sequence
+  std::vector<std::string> request_ids;
   // swap
   std::vector<BlockTransferInfo> swap_blocks;
   uint64_t batch_id;

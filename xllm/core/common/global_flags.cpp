@@ -327,6 +327,36 @@ DEFINE_uint64(output_shm_size,
 
 DEFINE_int32(num_speculative_tokens, 0, "Number of speculative tokens.");
 
+DEFINE_string(speculative_algorithm,
+              "mtp",
+              "Speculative algorithm, supported values: mtp, suffix.");
+
+DEFINE_int32(speculative_suffix_cache_max_depth,
+             64,
+             "Maximum suffix tree depth for suffix speculative decoding.");
+
+DEFINE_double(speculative_suffix_max_spec_factor,
+              1.0,
+              "Suffix speculation max tokens factor relative to match length.");
+
+DEFINE_double(speculative_suffix_max_spec_offset,
+              0.0,
+              "Suffix speculation max tokens additive offset.");
+
+DEFINE_double(speculative_suffix_min_token_prob,
+              0.1,
+              "Minimum token probability used in suffix speculation.");
+
+DEFINE_int32(speculative_suffix_max_cached_requests,
+             -1,
+             "Maximum globally cached requests for suffix speculation (-1 "
+             "unlimited, 0 disabled).");
+
+DEFINE_bool(speculative_suffix_use_tree_spec,
+            false,
+            "Whether to use tree-based suffix speculation instead of path "
+            "speculation.");
+
 DEFINE_bool(enable_atb_spec_kernel,
             false,
             "Whether to use ATB speculative kernel.");

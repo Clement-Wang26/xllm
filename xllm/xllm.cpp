@@ -165,6 +165,13 @@ int run() {
   FLAGS_reasoning_parser =
       ReasoningParser::get_parser_auto(FLAGS_reasoning_parser, model_type);
 
+  if (FLAGS_speculative_algorithm != "mtp" &&
+      FLAGS_speculative_algorithm != "suffix") {
+    LOG(FATAL) << "Invalid --speculative_algorithm: "
+               << FLAGS_speculative_algorithm
+               << ", expected one of: mtp, suffix";
+  }
+
   // Create Master
   Options options;
   options.model_path(FLAGS_model)
@@ -183,6 +190,18 @@ int run() {
       .max_seqs_per_batch(FLAGS_max_seqs_per_batch)
       .max_tokens_per_chunk_for_prefill(FLAGS_max_tokens_per_chunk_for_prefill)
       .num_speculative_tokens(FLAGS_num_speculative_tokens)
+      .speculative_algorithm(FLAGS_speculative_algorithm)
+      .speculative_suffix_cache_max_depth(
+          FLAGS_speculative_suffix_cache_max_depth)
+      .speculative_suffix_max_spec_factor(
+          FLAGS_speculative_suffix_max_spec_factor)
+      .speculative_suffix_max_spec_offset(
+          FLAGS_speculative_suffix_max_spec_offset)
+      .speculative_suffix_min_token_prob(
+          FLAGS_speculative_suffix_min_token_prob)
+      .speculative_suffix_max_cached_requests(
+          FLAGS_speculative_suffix_max_cached_requests)
+      .speculative_suffix_use_tree_spec(FLAGS_speculative_suffix_use_tree_spec)
       .num_request_handling_threads(FLAGS_num_request_handling_threads)
       .communication_backend(FLAGS_communication_backend)
       .enable_eplb(FLAGS_enable_eplb)

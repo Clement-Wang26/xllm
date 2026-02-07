@@ -15,6 +15,10 @@ limitations under the License.
 
 #pragma once
 
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
 #include "common/macros.h"
 #include "framework/kv_cache/embedding_allocator.h"
 #include "framework/sampling/rejection_sampler.h"
@@ -23,6 +27,7 @@ limitations under the License.
 #endif
 #include "runtime/llm_worker_impl.h"
 #include "runtime/options.h"
+#include "util/suffix_decoding_cache.h"
 
 namespace xllm {
 
@@ -140,6 +145,11 @@ class SpeculativeWorkerImpl : public WorkerImpl {
                         const std::vector<ForwardOutput>& draft_outputs,
                         const ForwardOutput& target_output);
 
+  SampleOutput validate(const SamplingParameters& sampling_params,
+                        const torch::Tensor& draft_token_ids,
+                        const torch::Tensor& draft_probs,
+                        const ForwardOutput& target_output);
+
   void update_sampling_params(SamplingParameters& sampling_params,
                               const int32_t num_val_tokens,
                               const int32_t total_num_val_tokens);
@@ -152,6 +162,12 @@ class SpeculativeWorkerImpl : public WorkerImpl {
   std::unique_ptr<LLMWorkerImpl> draft_impl_;
 
   std::shared_ptr<EmbeddingAllocator> embedding_allocator_;
+
+  bool use_suffix_decoding_ = false;
+  std::unique_ptr<SuffixDecodingCache> suffix_cache_;
+  std::unordered_map<std::string, std::vector<int32_t>> suffix_recent_tokens_;
+  std::unordered_set<std::string> suffix_active_decode_req_ids_;
+
 #if defined(USE_NPU)
   std::shared_ptr<SpecKVCacheTransfer> kv_cache_transfer_;
 #endif

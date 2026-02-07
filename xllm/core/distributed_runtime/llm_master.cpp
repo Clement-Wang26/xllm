@@ -45,9 +45,11 @@ volatile bool LLMAssistantMaster::running_ = false;
 
 LLMMaster::LLMMaster(const Options& options)
     : Master(options,
-             options.draft_model_path().value_or("").empty()
-                 ? EngineType::LLM
-                 : EngineType::SSM) {
+             (!options.draft_model_path().value_or("").empty() ||
+              (options.speculative_algorithm() == "suffix" &&
+               options.num_speculative_tokens() > 0))
+                 ? EngineType::SSM
+                 : EngineType::LLM) {
   CHECK(engine_->init());
   task_type_ = options_.task_type();
 

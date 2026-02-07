@@ -35,13 +35,46 @@ namespace {
                   : tensor_;                                                  \
   } while (0)
 
+void append_tokens_with_limit(std::vector<int32_t>& history,
+                              std::span<const int32_t> tokens,
+                              size_t max_size) {
+  history.insert(history.end(), tokens.begin(), tokens.end());
+  if (history.size() > max_size) {
+    history.erase(history.begin(), history.end() - max_size);
+  }
+}
+
+inline void check_kv_slot_inputs(int32_t position,
+                                 const Slice<int32_t>& block_table_slice,
+                                 int32_t block_size) {
+  CHECK_GT(block_size, 0) << "invalid block_size=" << block_size;
+  CHECK_GE(position, 0) << "invalid position=" << position;
+  const int32_t block_idx = position / block_size;
+  CHECK_LT(block_idx, static_cast<int32_t>(block_table_slice.size()))
+      << "block table out of range, position=" << position
+      << ", block_idx=" << block_idx << ", block_size=" << block_size
+      << ", block_table_size=" << block_table_slice.size();
+  const int32_t block_id = block_table_slice[block_idx];
+  CHECK_GE(block_id, 0) << "invalid block_id=" << block_id
+                        << " at block_idx=" << block_idx;
+  // In padded block table, pad value is 0. Accessing block_idx > 0 with
+  // block_id == 0 usually indicates we are writing into padded entries.
+  if (block_idx > 0) {
+    CHECK_NE(block_id, 0) << "likely padded block table accessed, block_idx="
+                          << block_idx << ", position=" << position
+                          << ", block_table_size=" << block_table_slice.size();
+  }
+}
+
 std::vector<int32_t> kv_cache_slots(int32_t pos_start,
                                     int32_t offset,
                                     const Slice<int32_t>& block_table_slice,
                                     int32_t block_size) {
+  CHECK_GE(offset, 0) << "invalid offset=" << offset;
   std::vector<int32_t> slots;
   slots.reserve(offset);
   for (int32_t i = pos_start; i < pos_start + offset; ++i) {
+    check_kv_slot_inputs(i, block_table_slice, block_size);
     const int32_t block_id = block_table_slice[i / block_size];
     const int32_t block_offset = i % block_size;
     slots.push_back(block_id * block_size + block_offset);
@@ -52,6 +85,7 @@ std::vector<int32_t> kv_cache_slots(int32_t pos_start,
 int32_t kv_cache_slot_id(int32_t position,
                          const Slice<int32_t>& block_table_slice,
                          int32_t block_size) {
+  check_kv_slot_inputs(position, block_table_slice, block_size);
   const int32_t block_id = block_table_slice[position / block_size];
   const int32_t block_offset = position % block_size;
   return block_id * block_size + block_offset;
@@ -103,6 +137,23 @@ void update_kv_seq_lens_and_max(std::vector<int32_t>& kv_seq_lens_vec,
 }
 
 // Batch expansion strategy for validation
+std::string summarize_int32_span(std::span<const int32_t> values,
+                                 size_t limit = 8) {
+  std::string out = "[";
+  const size_t n = std::min(values.size(), limit);
+  for (size_t i = 0; i < n; ++i) {
+    if (i > 0) {
+      out += ",";
+    }
+    out += std::to_string(values[i]);
+  }
+  if (values.size() > n) {
+    out += ",...";
+  }
+  out += "]";
+  return out;
+}
+
 void batch_expansion_process_seq_lens(
     std::vector<int32_t>& kv_seq_lens_vec,
     std::vector<int32_t>& q_seq_lens_vec,
@@ -150,14 +201,22 @@ SpeculativeWorkerImpl::SpeculativeWorkerImpl(const ParallelArgs& parallel_args,
   runtime_options.enable_schedule_overlap(false);
   impl_ =
       std::make_unique<LLMWorkerImpl>(parallel_args, device, runtime_options);
-  // here we specify num speculative tokens to 0 to pass the indication of
-  //  draft model to worker when enable_speculative_decode.
-  // NOTE: If you want to modify this part, make sure you also check the usage
-  // of
-  //  num_speculative_tokens in draft model.
-  runtime_options.num_decoding_tokens(1).num_speculative_tokens(0);
-  draft_impl_ =
-      std::make_unique<LLMWorkerImpl>(parallel_args, device, runtime_options);
+
+  use_suffix_decoding_ = options_.speculative_algorithm() == "suffix";
+  if (!use_suffix_decoding_) {
+    // here we specify num speculative tokens to 0 to pass the indication of
+    //  draft model to worker when enable_speculative_decode.
+    // NOTE: If you want to modify this part, make sure you also check the usage
+    // of
+    //  num_speculative_tokens in draft model.
+    runtime_options.num_decoding_tokens(1).num_speculative_tokens(0);
+    draft_impl_ =
+        std::make_unique<LLMWorkerImpl>(parallel_args, device, runtime_options);
+  } else {
+    suffix_cache_ = std::make_unique<SuffixDecodingCache>(
+        options_.speculative_suffix_cache_max_depth(),
+        options_.speculative_suffix_max_cached_requests());
+  }
 
   // performance debug for fixing the speculative acceptance rate
   // NOTE: This is for performance debugging only, it will
@@ -180,13 +239,14 @@ bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
       dtype_ = impl_->dtype();
       embedding_size_ = impl_->hidden_size();
     }
-  } else {
+  } else if (!use_suffix_decoding_ && draft_impl_ != nullptr) {
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::UNINITIALIZED);
     result =
         draft_impl_->WorkerImpl::init_model(model_weights_path, random_seed);
   }
 
-  if (draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
+  if (!use_suffix_decoding_ && draft_impl_ != nullptr &&
+      draft_impl_->get_status() == WorkerImpl::Status::LOADED) {
     // Deepseek MTP
 #if defined(USE_NPU)
     if (FLAGS_npu_kernel_backend != "TORCH") {
@@ -217,6 +277,10 @@ bool SpeculativeWorkerImpl::init_model(const std::string& model_weights_path,
 
 bool SpeculativeWorkerImpl::allocate_kv_cache(
     const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  if (use_suffix_decoding_) {
+    return impl_->allocate_kv_cache(kv_cache_shape);
+  }
+
   // init embedding cache, using total number of blocks
   if (impl_->get_status() == WorkerImpl::Status::LOADED) {
     embedding_allocator_ = std::make_shared<EmbeddingAllocator>(
@@ -226,6 +290,7 @@ bool SpeculativeWorkerImpl::allocate_kv_cache(
   if (impl_->get_status() == WorkerImpl::Status::LOADED) {
     return impl_->allocate_kv_cache(kv_cache_shape);
   } else {
+    CHECK(draft_impl_ != nullptr);
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::LOADED);
     return draft_impl_->allocate_kv_cache(kv_cache_shape);
   }
@@ -235,6 +300,19 @@ bool SpeculativeWorkerImpl::allocate_kv_cache(
 bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
     const uint64_t kv_cache_size,
     const std::vector<std::vector<int64_t>>& kv_cache_shape) {
+  if (use_suffix_decoding_) {
+    kv_cache_transfer_ = std::make_shared<SpecKVCacheTransfer>(
+        options_.device_ip().value(),
+        options_.transfer_listen_port(),
+        options_.instance_role(),
+        context_.get_model_args().model_type());
+
+    int32_t device_id = device_.index();
+    kv_cache_transfer_->initialize(device_id);
+    impl_->allocate_kv_cache_with_transfer(kv_cache_transfer_, kv_cache_shape);
+    return true;
+  }
+
   if (impl_->get_status() == WorkerImpl::Status::LOADED) {
     kv_cache_transfer_ = std::make_shared<SpecKVCacheTransfer>(
         options_.device_ip().value(),
@@ -246,6 +324,7 @@ bool SpeculativeWorkerImpl::allocate_kv_cache_with_transfer(
     kv_cache_transfer_->initialize(device_id);
     impl_->allocate_kv_cache_with_transfer(kv_cache_transfer_, kv_cache_shape);
   } else {
+    CHECK(draft_impl_ != nullptr);
     CHECK_EQ(draft_impl_->get_status(), WorkerImpl::Status::LOADED);
     draft_impl_->allocate_kv_cache_with_transfer(kv_cache_transfer_,
                                                  kv_cache_shape);
@@ -273,13 +352,19 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step_empty(
     const ForwardInput& input) {
   if (!input.input_params.batch_forward_type.is_decode()) {
     auto output = impl_->step(input);
-    auto draft_output = draft_impl_->step(input);
+    if (!use_suffix_decoding_) {
+      auto draft_output = draft_impl_->step(input);
+      (void)draft_output;
+    }
     output->sample_output.embeddings = torch::Tensor();
     return output;
   } else {
-    for (size_t i = 0; i < options_.num_speculative_tokens(); ++i) {
-      auto draft_future = draft_impl_->step_async(input);
-      ForwardOutput draft_output = std::move(draft_future).get().value();
+    if (!use_suffix_decoding_) {
+      for (size_t i = 0; i < options_.num_speculative_tokens(); ++i) {
+        auto draft_future = draft_impl_->step_async(input);
+        ForwardOutput draft_output = std::move(draft_future).get().value();
+        (void)draft_output;
+      }
     }
 
     ForwardInput new_input = input;
@@ -299,14 +384,83 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step_prefill(
   Timer timer;
   // run the target model to get first token and hidden states
   auto future = impl_->step_async(input);
-  // MTP (Eagle Medusa) which depend on hidden states need this step
-  // The others speculative model use inputs directly
-  // ForwardInput prefill_inputs;
-  ForwardInput prefill_input;
-  prepare_prefill_inputs(input, prefill_input);
   ForwardOutput output = std::move(future).get().value();
   COUNTER_ADD(speculative_execution_latency_seconds_target,
               timer.elapsed_seconds());
+
+  if (use_suffix_decoding_) {
+    const auto& input_params = input.input_params;
+    const int32_t num_sequences = input_params.num_sequences;
+    const auto& request_ids = input_params.request_ids;
+
+    if (suffix_cache_ != nullptr &&
+        request_ids.size() == static_cast<size_t>(num_sequences)) {
+      torch::Tensor token_ids = safe_to(input.token_ids, torch::kCPU);
+      Slice<int32_t> tokens_ids_slice = {
+          token_ids.data_ptr<int32_t>(),
+          static_cast<size_t>(input.token_ids.numel())};
+
+      int32_t start_idx = 0;
+      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+        int32_t q_len = input_params.get_q_seq_len(seq_id);
+        Slice<int32_t> seq_tokens =
+            tokens_ids_slice.slice(start_idx, start_idx + q_len);
+        start_idx += q_len;
+
+        const std::string req_id = request_ids[seq_id];
+        if (req_id.empty()) {
+          continue;
+        }
+
+        if (!suffix_cache_->has_active_request(req_id)) {
+          suffix_cache_->start_request(req_id, seq_tokens);
+          suffix_recent_tokens_[req_id].clear();
+        } else {
+          suffix_cache_->add_active_prompt(req_id, seq_tokens);
+        }
+        append_tokens_with_limit(
+            suffix_recent_tokens_[req_id],
+            seq_tokens,
+            static_cast<size_t>(suffix_cache_->max_tree_depth()));
+      }
+
+      torch::Tensor next_tokens =
+          safe_to(output.sample_output.next_tokens, torch::kCPU);
+      if (next_tokens.defined() &&
+          next_tokens.numel() == static_cast<int64_t>(num_sequences)) {
+        next_tokens = next_tokens.view({-1}).to(torch::kInt);
+        Slice<int32_t> next_tokens_slice = {
+            next_tokens.data_ptr<int32_t>(),
+            static_cast<size_t>(next_tokens.numel())};
+        for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+          int32_t token = next_tokens_slice[seq_id];
+          if (token < 0) {
+            continue;
+          }
+          const std::string req_id = request_ids[seq_id];
+          if (req_id.empty()) {
+            continue;
+          }
+          suffix_cache_->add_active_response(
+              req_id, std::span<const int32_t>(&token, 1));
+          append_tokens_with_limit(
+              suffix_recent_tokens_[req_id],
+              std::span<const int32_t>(&token, 1),
+              static_cast<size_t>(suffix_cache_->max_tree_depth()));
+        }
+      }
+    }
+
+    output.sample_output.embeddings = torch::Tensor();
+    if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
+      return std::nullopt;
+    }
+    return output;
+  }
+
+  // MTP (Eagle Medusa) path that depends on hidden states.
+  ForwardInput prefill_input;
+  prepare_prefill_inputs(input, prefill_input);
 
   // prepare input for draft model
   auto& embeddings = output.sample_output.embeddings;
@@ -325,6 +479,7 @@ std::optional<ForwardOutput> SpeculativeWorkerImpl::step_prefill(
   timer.reset();
   auto draft_future = draft_impl_->step_async(prefill_input);
   ForwardOutput draft_output = std::move(draft_future).get().value();
+  (void)draft_output;
   COUNTER_ADD(speculative_execution_latency_seconds_draft,
               timer.elapsed_seconds());
 
@@ -383,8 +538,216 @@ void SpeculativeWorkerImpl::prepare_prefill_inputs(
 
 std::optional<ForwardOutput> SpeculativeWorkerImpl::step_decode(
     const ForwardInput& input) {
-  // TODO : now only support Deepseek MTP
-  // More work need to support n-gram and native speculative decoding.
+  if (use_suffix_decoding_) {
+    const int32_t num_speculative_tokens = options_.num_speculative_tokens();
+    const int32_t num_sequences = input.input_params.num_sequences;
+    const int32_t num_val_tokens = num_speculative_tokens + 1;
+    const auto& request_ids = input.input_params.request_ids;
+
+    const bool has_request_ids =
+        suffix_cache_ != nullptr &&
+        request_ids.size() == static_cast<size_t>(num_sequences);
+    if (has_request_ids) {
+      std::unordered_set<std::string> current_req_ids;
+      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+        if (!request_ids[seq_id].empty()) {
+          current_req_ids.insert(request_ids[seq_id]);
+        }
+      }
+
+      for (const auto& req_id : suffix_active_decode_req_ids_) {
+        if (current_req_ids.find(req_id) == current_req_ids.end()) {
+          if (suffix_cache_->has_active_request(req_id)) {
+            suffix_cache_->stop_request(req_id);
+          }
+          suffix_recent_tokens_.erase(req_id);
+        }
+      }
+      suffix_active_decode_req_ids_ = std::move(current_req_ids);
+    }
+
+    torch::Tensor input_token_ids = safe_to(input.token_ids, torch::kCPU);
+    Slice<int32_t> input_tokens_slice = {
+        input_token_ids.data_ptr<int32_t>(),
+        static_cast<size_t>(input_token_ids.numel())};
+
+    Timer timer;
+
+    std::vector<int32_t> draft_tokens_flat;
+    draft_tokens_flat.reserve(num_sequences * num_speculative_tokens);
+    std::vector<std::string> req_ids(num_sequences);
+
+    for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+      int32_t fallback_token = input_tokens_slice[seq_id];
+      for (int32_t i = 0; i < num_speculative_tokens; ++i) {
+        draft_tokens_flat.emplace_back(fallback_token);
+      }
+
+      if (suffix_cache_ == nullptr ||
+          request_ids.size() != static_cast<size_t>(num_sequences)) {
+        continue;
+      }
+
+      const std::string req_id = request_ids[seq_id];
+      if (req_id.empty()) {
+        continue;
+      }
+      req_ids[seq_id] = req_id;
+
+      if (!suffix_cache_->has_active_request(req_id)) {
+        suffix_cache_->start_request(
+            req_id, std::span<const int32_t>(&fallback_token, 1));
+        suffix_recent_tokens_[req_id].clear();
+        append_tokens_with_limit(
+            suffix_recent_tokens_[req_id],
+            std::span<const int32_t>(&fallback_token, 1),
+            static_cast<size_t>(suffix_cache_->max_tree_depth()));
+      }
+
+      auto& history = suffix_recent_tokens_[req_id];
+      if (history.empty()) {
+        append_tokens_with_limit(
+            history,
+            std::span<const int32_t>(&fallback_token, 1),
+            static_cast<size_t>(suffix_cache_->max_tree_depth()));
+      }
+
+      SuffixDecodingDraft draft = suffix_cache_->speculate(
+          req_id,
+          std::span<const int32_t>(history.data(), history.size()),
+          /*max_spec_tokens=*/num_speculative_tokens,
+          options_.speculative_suffix_max_spec_factor(),
+          options_.speculative_suffix_max_spec_offset(),
+          options_.speculative_suffix_min_token_prob(),
+          options_.speculative_suffix_use_tree_spec());
+
+      const int32_t fill_count =
+          std::min<int32_t>(num_speculative_tokens, draft.token_ids.size());
+      for (int32_t i = 0; i < fill_count; ++i) {
+        draft_tokens_flat[seq_id * num_speculative_tokens + i] =
+            draft.token_ids[i];
+      }
+    }
+
+    ForwardInput validate_input;
+    prepare_validate_inputs(input, validate_input);
+
+    auto& validate_token_ids = validate_input.token_ids;
+    for (int32_t i = 0; i < num_speculative_tokens; ++i) {
+      std::vector<int32_t> draft_col;
+      draft_col.reserve(num_sequences);
+      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+        draft_col.emplace_back(
+            draft_tokens_flat[seq_id * num_speculative_tokens + i]);
+      }
+      auto draft_col_tensor =
+          torch::tensor(draft_col, validate_token_ids.options());
+      auto mask = (validate_token_ids == -1 * (i + 1));
+      validate_token_ids.masked_scatter_(mask, draft_col_tensor);
+    }
+
+    COUNTER_ADD(speculative_execution_latency_seconds_draft,
+                timer.elapsed_seconds());
+
+    timer.reset();
+    auto future = impl_->step_async(validate_input);
+    ForwardOutput target_output = std::move(future).get().value();
+    COUNTER_ADD(speculative_execution_latency_seconds_target,
+                timer.elapsed_seconds());
+
+    torch::Tensor draft_token_ids =
+        torch::tensor(draft_tokens_flat,
+                      torch::TensorOptions().dtype(torch::kLong))
+            .view({num_sequences, num_speculative_tokens})
+            .to(target_output.logits.device());
+
+    const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
+    auto draft_probs =
+        torch::zeros({num_sequences, num_speculative_tokens, vocab_size},
+                     torch::TensorOptions()
+                         .dtype(torch::kFloat32)
+                         .device(target_output.logits.device()));
+    draft_probs.scatter_(/*dim=*/2, draft_token_ids.unsqueeze(-1), 1.0f);
+
+    timer.reset();
+    SampleOutput val_output = validate(
+        input.sampling_params, draft_token_ids, draft_probs, target_output);
+    COUNTER_ADD(speculative_execution_latency_seconds_validation,
+                timer.elapsed_seconds());
+
+    if (suffix_cache_ != nullptr &&
+        request_ids.size() == static_cast<size_t>(num_sequences)) {
+      torch::Tensor accepted_tokens =
+          safe_to(val_output.next_tokens, torch::kCPU).to(torch::kInt);
+      accepted_tokens = accepted_tokens.view({num_sequences, num_val_tokens});
+      Slice<int32_t> accepted_tokens_slice = {
+          accepted_tokens.data_ptr<int32_t>(),
+          static_cast<size_t>(accepted_tokens.numel())};
+
+      for (int32_t seq_id = 0; seq_id < num_sequences; ++seq_id) {
+        const std::string& req_id = req_ids[seq_id];
+        if (req_id.empty()) {
+          continue;
+        }
+
+        std::vector<int32_t> accepted;
+        accepted.reserve(num_val_tokens);
+        int32_t first_reject_idx = -1;
+        std::vector<int32_t> row_tokens;
+        row_tokens.reserve(num_val_tokens);
+        for (int32_t j = 0; j < num_val_tokens; ++j) {
+          int32_t token = accepted_tokens_slice[seq_id * num_val_tokens + j];
+          row_tokens.emplace_back(token);
+          if (token < 0) {
+            if (first_reject_idx < 0) {
+              first_reject_idx = j;
+            }
+            break;
+          }
+          accepted.emplace_back(token);
+        }
+
+        if (seq_id < 8) {
+          LOG(INFO) << "[spec-validate-output] seq=" << seq_id
+                    << " req_id=" << req_id
+                    << " accepted_len=" << accepted.size()
+                    << " first_reject_idx=" << first_reject_idx << " accepted="
+                    << summarize_int32_span(std::span<const int32_t>(
+                           accepted.data(), accepted.size()))
+                    << " row_tokens="
+                    << summarize_int32_span(std::span<const int32_t>(
+                           row_tokens.data(), row_tokens.size()));
+          LOG(INFO) << "[spec-reject-handle] seq=" << seq_id
+                    << " accepted_prefix_len=" << accepted.size()
+                    << " first_reject_idx=" << first_reject_idx
+                    << " pos_offset="
+                    << (static_cast<int32_t>(accepted.size()) - 1)
+                    << " row_tokens="
+                    << summarize_int32_span(std::span<const int32_t>(
+                           row_tokens.data(), row_tokens.size()));
+        }
+
+        if (!accepted.empty()) {
+          suffix_cache_->add_active_response(
+              req_id,
+              std::span<const int32_t>(accepted.data(), accepted.size()));
+          append_tokens_with_limit(
+              suffix_recent_tokens_[req_id],
+              std::span<const int32_t>(accepted.data(), accepted.size()),
+              static_cast<size_t>(suffix_cache_->max_tree_depth()));
+        }
+      }
+    }
+
+    if (!enable_schedule_overlap() && !driver_ && !dp_driver_) {
+      return std::nullopt;
+    }
+    val_output.embeddings = torch::Tensor();
+    target_output.sample_output = val_output;
+    return target_output;
+  }
+
+  // MTP path.
   ForwardInput draft_input = input;
   // get embedding cache
   torch::Tensor embeddings =
@@ -493,6 +856,9 @@ void SpeculativeWorkerImpl::prepare_draft_inputs(const ForwardInput& input,
     new_token_slot_ids.emplace_back(slot_id);
   }
 
+  CHECK_EQ(new_token_slot_ids.size(), new_positions.size())
+      << "draft kv slots/positions mismatch";
+
   draft_input.positions = torch::tensor(new_positions, int_options);
   // update the input_params
   input_params.kv_max_seq_len = kv_max_seq_len;
@@ -590,13 +956,37 @@ void SpeculativeWorkerImpl::prepare_validate_inputs(
 
     // process slot id
     int32_t start_position = positions_slice[seq_id] + position_offset;
+    int32_t kv_len = calculate_kv_len(kv_seq_lens_slice, seq_id, /*offset=*/0);
+    CHECK_EQ(start_position, kv_len)
+        << "validate position/kv_len mismatch, seq_id=" << seq_id
+        << ", start_position=" << start_position << ", kv_len=" << kv_len;
     auto slot_ids = kv_cache_slots(start_position,
                                    num_val_tokens,
                                    block_table_slice,
                                    options_.block_size());
     new_token_slot_ids.insert(
         new_token_slot_ids.end(), slot_ids.begin(), slot_ids.end());
+
+    if (seq_id < 4) {
+      LOG(INFO) << "[spec-validate-input] seq=" << seq_id
+                << " start_pos=" << start_position << " kv_len=" << kv_len
+                << " num_val_tokens=" << num_val_tokens << " slots="
+                << summarize_int32_span(std::span<const int32_t>(
+                       slot_ids.data(), slot_ids.size()));
+    }
   }
+
+  LOG(INFO) << "[spec-validate-input] total new_tokens=" << new_token_ids.size()
+            << " new_positions=" << new_positions.size()
+            << " new_slots=" << new_token_slot_ids.size()
+            << " num_sequences=" << num_sequences
+            << " num_val_tokens=" << num_val_tokens
+            << " atb_kernel=" << FLAGS_enable_atb_spec_kernel;
+
+  CHECK_EQ(new_token_slot_ids.size(), new_token_ids.size())
+      << "validate kv slots/tokens mismatch";
+  CHECK_EQ(new_positions.size(), new_token_ids.size())
+      << "validate positions/tokens mismatch";
 
   validate_input.token_ids = torch::tensor(new_token_ids, int_options);
   validate_input.positions = torch::tensor(new_positions, int_options);
@@ -653,18 +1043,6 @@ SampleOutput SpeculativeWorkerImpl::validate(
   const int32_t batch_size = num_target_tokens / num_val_tokens;
   const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
 
-  using torch::indexing::None;
-  using ISlice = torch::indexing::Slice;
-  auto bonus_token_ids =
-      target_output.sample_output.next_tokens
-          .index({"...", ISlice(num_val_tokens - 1, None, num_val_tokens)})
-          .view({-1, 1});
-
-  // [batch_size, n_speculative_tokens, vocab_size]
-  auto target_logits =
-      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
-
-  // prepare input for rejection sampling
   std::vector<torch::Tensor> draft_token_ids_vec;
   std::vector<torch::Tensor> draft_probs_vec;
   for (const auto& draft_output : draft_outputs) {
@@ -676,11 +1054,33 @@ SampleOutput SpeculativeWorkerImpl::validate(
     draft_probs_vec.push_back(draft_probs);
   }
 
-  // concatenate the draft token ids and probs along the last dimension
-  const auto draft_token_ids =
-      torch::cat(draft_token_ids_vec, /*dim=*/1).to(bonus_token_ids);
-  const auto draft_probs =
-      torch::cat(draft_probs_vec, /*dim=*/1).to(target_logits.device());
+  const auto draft_token_ids = torch::cat(draft_token_ids_vec, /*dim=*/1);
+  const auto draft_probs = torch::cat(draft_probs_vec, /*dim=*/1);
+  return validate(sampling_params, draft_token_ids, draft_probs, target_output);
+}
+
+SampleOutput SpeculativeWorkerImpl::validate(
+    const SamplingParameters& sampling_params,
+    const torch::Tensor& draft_token_ids,
+    const torch::Tensor& draft_probs,
+    const ForwardOutput& target_output) {
+  const int32_t num_target_tokens =
+      target_output.sample_output.next_tokens.numel();
+  const int32_t num_val_tokens = options_.num_speculative_tokens() + 1;
+  CHECK_EQ(num_target_tokens % num_val_tokens, 0);
+  const int32_t batch_size = num_target_tokens / num_val_tokens;
+  const int32_t vocab_size = target_output.logits.size(/*dim=*/-1);
+
+  using torch::indexing::None;
+  using ISlice = torch::indexing::Slice;
+  auto bonus_token_ids =
+      target_output.sample_output.next_tokens
+          .index({"...", ISlice(num_val_tokens - 1, None, num_val_tokens)})
+          .view({-1, 1});
+
+  // [batch_size, n_speculative_tokens + 1, vocab_size]
+  auto target_logits =
+      target_output.logits.view({batch_size, num_val_tokens, vocab_size});
 
   auto rejection_sampler =
       std::make_unique<RejectionSampler>(sampling_params.do_sample,
@@ -693,8 +1093,8 @@ SampleOutput SpeculativeWorkerImpl::validate(
 
   // get the accepted tokens
   SampleOutput sample_output =
-      rejection_sampler->forward(draft_token_ids,
-                                 draft_probs,
+      rejection_sampler->forward(draft_token_ids.to(bonus_token_ids),
+                                 draft_probs.to(target_logits.device()),
                                  target_logits,
                                  bonus_token_ids,
                                  /*mask_out_rejected_tokens=*/true);
@@ -775,12 +1175,34 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
       int32_t last_step_index = -1 * tokens_ids_slice[seq_id] - 1;
       last_step_index = last_step_index * last_step_decode_num;
       postion_offset = -1;
+      int32_t accepted_prefix_len = 0;
+      int32_t first_reject_idx = -1;
       for (int i = 0; i < last_step_decode_num; ++i) {
         int32_t token_id = last_tokens_ids_slice[last_step_index + i];
         if (token_id >= 0) {
           last_step_token_id = token_id;
           postion_offset += 1;
+          accepted_prefix_len += 1;
+        } else if (first_reject_idx < 0) {
+          first_reject_idx = i;
         }
+      }
+
+      if (seq_id < 8) {
+        std::vector<int32_t> last_step_row_tokens;
+        last_step_row_tokens.reserve(last_step_decode_num);
+        for (int i = 0; i < last_step_decode_num; ++i) {
+          last_step_row_tokens.emplace_back(
+              static_cast<int32_t>(last_tokens_ids_slice[last_step_index + i]));
+        }
+        LOG(INFO) << "[spec-reject-handle] seq=" << seq_id
+                  << " placeholder=" << tokens_ids_slice[seq_id]
+                  << " accepted_prefix_len=" << accepted_prefix_len
+                  << " first_reject_idx=" << first_reject_idx
+                  << " pos_offset=" << postion_offset << " row_tokens="
+                  << summarize_int32_span(
+                         std::span<const int32_t>(last_step_row_tokens.data(),
+                                                  last_step_row_tokens.size()));
       }
     }
 
@@ -801,7 +1223,24 @@ ForwardInput SpeculativeWorkerImpl::update_input_by_last_step_output(
     int32_t slot_id =
         kv_cache_slot_id(new_positions.back(), block_table_slice, block_size);
     new_token_slot_ids.emplace_back(slot_id);
+
+    if (seq_id < 8) {
+      LOG(INFO) << "[spec-step-update] seq=" << seq_id
+                << " pos_offset=" << postion_offset
+                << " new_pos=" << new_positions.back()
+                << " new_token=" << new_token_ids.back()
+                << " new_slot=" << slot_id;
+    }
   }
+
+  LOG(INFO) << "[spec-step-update] total new_tokens=" << new_token_ids.size()
+            << " new_positions=" << new_positions.size()
+            << " new_slots=" << new_token_slot_ids.size();
+
+  CHECK_EQ(new_token_slot_ids.size(), new_token_ids.size())
+      << "step-update kv slots/tokens mismatch";
+  CHECK_EQ(new_positions.size(), new_token_ids.size())
+      << "step-update positions/tokens mismatch";
 
   // Create new tensors with updated values
   torch::TensorOptions int_options = inputs.token_ids.options();

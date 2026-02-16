@@ -624,11 +624,18 @@ bool WorkerImpl::wakeup(const WakeupOptions& options) {
       return false;
     }
 
+    // Establish D2D connections to all remote transfer engines
+    if (!weight_transfer_->link_d2d(options.remote_addrs)) {
+      LOG(ERROR) << "Failed to link D2D to remote addrs";
+      return false;
+    }
+
     // Destination is always contiguous (local allocation)
     uint64_t dst_base_offset =
         reinterpret_cast<uintptr_t>(tensors->weight_base_ptr) -
         reinterpret_cast<uintptr_t>(global_xtensor.base_vaddr());
 
+    bool transfer_success = true;
     for (size_t i = 0; i < options.remote_addrs.size(); ++i) {
       const auto& segments = options.src_weight_segments[i];
       uint64_t dst_offset = dst_base_offset;
@@ -640,10 +647,19 @@ bool WorkerImpl::wakeup(const WakeupOptions& options) {
           LOG(ERROR) << "Failed to pull remote weight segment from "
                      << options.remote_addrs[i] << ", src_offset=" << seg.offset
                      << ", size=" << seg.size;
-          return false;
+          transfer_success = false;
+          break;
         }
         dst_offset += seg.size;
       }
+      if (!transfer_success) break;
+    }
+
+    // Close D2D connections
+    weight_transfer_->unlink_d2d(options.remote_addrs);
+
+    if (!transfer_success) {
+      return false;
     }
 
     model_->reload_model_weights_from_device();

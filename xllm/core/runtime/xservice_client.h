@@ -101,6 +101,7 @@ class XServiceClient {
   const BlockManagerPool* block_manager_pool_ = nullptr;  // not own
   Scheduler* scheduler_ = nullptr;                        // not own
   Engine* engine_ = nullptr;  // not own, for xtensor info
+  std::vector<std::string> device_addrs_cache_;  // cached device addrs for D2D
 };
 
 }  // namespace xllm

@@ -132,16 +132,35 @@ bool MooncakeTransferEngineCore::open_session(const uint64_t cluster_id,
 
     proto::SessionInfo proto_session_info;
     proto_session_info.set_addr(addr_);
-    proto::Status status;
+    proto::OpenSessionResponse response;
     brpc::Controller cntl;
-    stub->OpenSession(&cntl, &proto_session_info, &status, nullptr);
-    if (cntl.Failed() || !status.ok()) {
+    stub->OpenSession(&cntl, &proto_session_info, &response, nullptr);
+    if (cntl.Failed() || !response.ok()) {
       LOG(ERROR) << "OpenSession failed, " << cntl.ErrorText();
       return false;
     }
 
     LOG(INFO) << "OpenSession RPC to " << remote_addr
               << ", local_addr=" << addr_;
+
+    // Also create local handle for pulling from remote
+    std::string remote_p2p_addr = response.addr();
+    if (!remote_p2p_addr.empty()) {
+      Transport::SegmentHandle handle = engine_->openSegment(remote_p2p_addr);
+      if (handle == (Transport::SegmentHandle)-1) {
+        LOG(ERROR) << "Failed to open local segment for " << remote_p2p_addr;
+        return false;
+      }
+
+      SessionInfo session_info;
+      session_info.handle = handle;
+      session_info.ref_count = 1;
+      handles_[remote_addr] = session_info;
+
+      LOG(INFO) << "Created bidirectional session for " << remote_addr
+                << " (P2P addr: " << remote_p2p_addr << "), ref_count=1";
+    }
+
     return true;
   }
 
@@ -202,6 +221,14 @@ bool MooncakeTransferEngineCore::close_session(const uint64_t cluster_id,
       LOG(ERROR) << "CloseSession failed, " << cntl.ErrorText();
       return false;
     }
+
+    // Also close local handle if it exists
+    if (it != handles_.end()) {
+      engine_->closeSegment(it->second.handle);
+      handles_.erase(it);
+      LOG(INFO) << "Closed local session for " << remote_addr;
+    }
+
     return true;
   }
 
@@ -628,7 +655,7 @@ bool MooncakeTransferEngine::push_memory_blocks(
 void MooncakeTransferEngineService::OpenSession(
     ::google::protobuf::RpcController* controller,
     const proto::SessionInfo* request,
-    proto::Status* response,
+    proto::OpenSessionResponse* response,
     ::google::protobuf::Closure* done) {
   brpc::ClosureGuard done_guard(done);
   if (!request || !response || !controller) {
@@ -641,6 +668,9 @@ void MooncakeTransferEngineService::OpenSession(
       MooncakeTransferEngineCore::get_instance().open_session(0, remote_addr);
 
   response->set_ok(result);
+  if (result) {
+    response->set_addr(MooncakeTransferEngineCore::get_instance().addr());
+  }
 }
 
 void MooncakeTransferEngineService::CloseSession(

@@ -11,7 +11,12 @@ message SessionInfo {
   string addr = 1;
 }
 
+message OpenSessionResponse {
+  bool ok = 1;
+  string addr = 2;
+}
+
 service MooncakeTransferEngineService {
-  rpc OpenSession(SessionInfo) returns (Status) {}
+  rpc OpenSession(SessionInfo) returns (OpenSessionResponse) {}
   rpc CloseSession(SessionInfo) returns (Status) {}
 }

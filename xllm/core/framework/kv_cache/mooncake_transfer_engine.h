@@ -156,7 +156,7 @@ class MooncakeTransferEngineService
 
   virtual void OpenSession(google::protobuf::RpcController* controller,
                            const proto::SessionInfo* request,
-                           proto::Status* response,
+                           proto::OpenSessionResponse* response,
                            google::protobuf::Closure* done) override;
 
   virtual void CloseSession(google::protobuf::RpcController* controller,

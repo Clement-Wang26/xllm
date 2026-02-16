@@ -58,7 +58,9 @@ message XTensorHeartbeatInfo {
   repeated uint64 worker_free_phy_pages = 1;
   // Model weight segments in GlobalXtensor (key: model_id)
   // Ordered segments that concatenate to form the full model weights
-  map<string, WeightSegmentList> model_weight_segments = 3;
+  map<string, WeightSegmentList> model_weight_segments = 2;
+  // Per-worker device addresses for D2D transfer (format: "IP:port")
+  repeated string device_addrs = 3;
 }
 
 // A single weight segment in GlobalXtensor

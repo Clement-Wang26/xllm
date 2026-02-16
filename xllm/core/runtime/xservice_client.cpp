@@ -312,6 +312,20 @@ void XServiceClient::heartbeat() {
           proto_seg->set_size(seg.size);
         }
       }
+
+      // Report device addresses for D2D weight transfer
+      if (device_addrs_cache_.empty()) {
+        std::vector<std::string> device_ips;
+        std::vector<uint16_t> ports;
+        engine_->get_device_info(device_ips, ports);
+        for (size_t i = 0; i < device_ips.size() && i < ports.size(); ++i) {
+          device_addrs_cache_.push_back(device_ips[i] + ":" +
+                                        std::to_string(ports[i]));
+        }
+      }
+      for (const auto& addr : device_addrs_cache_) {
+        xtensor_info->add_device_addrs(addr);
+      }
     }
 
     xllm_service::proto::Status resp;

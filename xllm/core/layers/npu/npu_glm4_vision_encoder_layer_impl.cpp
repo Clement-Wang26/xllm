@@ -20,8 +20,9 @@ limitations under the License.
 #include <mstx/ms_tools_ext.h>
 
 #include <iostream>
-#include <map>
 
+#include "common/global_flags.h"
+#include "loader/glm4_vision_encoder_manual_loader.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUException.h"
 #include "xllm_atb_layers/models/glm4v/glm4v_encoder.h"
@@ -41,23 +42,6 @@ enum Glm4VisionEncoderLayerTensorId : int {
 };
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 8;
-
-static std::vector<std::pair<int, std::string>> WEIGHT_MAPPING = {
-    {IN_INPUT_NORM_WEIGHT, "norm1.weight"},
-    {IN_POST_NORM_WEIGHT, "norm2.weight"},
-    {IN_QKV_WEIGHT, "attn.qkv.weight"},
-    {IN_ATTN_PROJ_WEIGHT, "attn.proj.weight"},
-    {IN_LINEAR_GATE_WEIGHT, "mlp.gate_proj.weight"},
-    {IN_LINEAR_UP_WEIGHT, "mlp.up_proj.weight"},
-    {IN_LINEAR_DOWN_WEIGHT, "mlp.down_proj.weight"}};
-
-// {weight,dim}
-// IN_QKV_WEIGHT SHARD artificially in merge_loaded_weights
-static std::map<int, int> WEIGHT_SHARD = {{IN_ATTN_PROJ_WEIGHT, 1},
-                                          {IN_LINEAR_UP_WEIGHT, 0},
-                                          {IN_LINEAR_GATE_WEIGHT, 0},
-                                          {IN_LINEAR_DOWN_WEIGHT, 1}};
-// TODO: check shape with atb log -- HW pxy
 
 void NpuGlm4VisionEncoderLayerImpl::param_from_args(
     atb_speed::glm::VisionEncoderLayerParam& param,
@@ -104,60 +88,26 @@ NpuGlm4VisionEncoderLayerImpl::NpuGlm4VisionEncoderLayerImpl(
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     at_weight_tensors_[i] = torch::zeros({1}).to(options);
   }
-}
-
-void NpuGlm4VisionEncoderLayerImpl::verify_loaded_weights() const {
-  for (const auto& [index, name] : WEIGHT_MAPPING) {
-    CHECK(at_weight_tensors_[index].sizes() != std::vector<int64_t>({1}))
-        << "weight is not loaded for " << name;
+  if (FLAGS_enable_manual_loader) {
+    loader_ = std::make_unique<Glm4VisionEncoderManualLoader>(
+        WEIGHT_COUNT_PER_LAYER, context);
+  } else {
+    loader_ = std::make_unique<Glm4VisionEncoderLoader>(WEIGHT_COUNT_PER_LAYER,
+                                                        context);
   }
 }
 
 void NpuGlm4VisionEncoderLayerImpl::merge_loaded_weights() {
-  if (encode_param_.worldSize > 1) {
-    // spilt pack qkv weight when enable tp
-    get_weights_col_packed_qkv();
-  }
-
-  at_weight_tensors_[IN_LINEAR_GATE_UP_WEIGHT] =
-      torch::cat({at_weight_tensors_[IN_LINEAR_GATE_WEIGHT],
-                  at_weight_tensors_[IN_LINEAR_UP_WEIGHT]},
-                 0);
-  at_weight_tensors_[IN_LINEAR_GATE_WEIGHT] = torch::empty({}, device_);
-  at_weight_tensors_[IN_LINEAR_UP_WEIGHT] = torch::empty({}, device_);
-
+  CHECK(loader_ != nullptr) << "glm4 vision encoder loader is not initialized";
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
   Device::empty_cache(device_.index());
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     atb_weight_tensors_[i] =
-        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors_[i]);
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
   }
 
   init_layer();
-}
-
-// tp spilt weight
-void NpuGlm4VisionEncoderLayerImpl::get_weights_col_packed_qkv() {
-  int rank = encode_param_.rank;
-  int worldSize = encode_param_.worldSize;
-  // split qkv weight
-  auto qkv_weight = torch::chunk(at_weight_tensors_[IN_QKV_WEIGHT], 3, 0);
-  // get local weight and merge
-  auto new_qkv_weight = torch::cat({(qkv_weight[0].chunk(worldSize, 0))[rank],
-                                    (qkv_weight[1].chunk(worldSize, 0))[rank],
-                                    (qkv_weight[2].chunk(worldSize, 0))[rank]},
-                                   0);
-  at_weight_tensors_[IN_QKV_WEIGHT] = new_qkv_weight;
-}
-
-void NpuGlm4VisionEncoderLayerImpl::load_state_dict(
-    const StateDict& state_dict) {
-  for (const auto& [index, name] : WEIGHT_MAPPING) {
-    if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
-      set_weight(state_dict, name, index, WEIGHT_SHARD[index]);
-    } else {
-      set_weight(state_dict, name, index);
-    }
-  }
 }
 
 int64_t NpuGlm4VisionEncoderLayerImpl::init_layer() {

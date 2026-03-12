@@ -18,9 +18,9 @@ limitations under the License.
 #include <glog/logging.h>
 #include <mstx/ms_tools_ext.h>
 
-#include <map>
-
 #include "common/global_flags.h"
+#include "loader/glm4_decoder_loader.h"
+#include "loader/glm4_decoder_manual_loader.h"
 #include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
 #include "torch_npu/csrc/core/npu/NPUException.h"
 
@@ -92,42 +92,6 @@ enum DecoderLayerTensorId : int {
 };
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 52;
-
-static std::unordered_map<std::string, int> WEIGHT_MAPPING = {
-    {"input_layernorm.weight", IN_NORM_WEIGHT},
-
-    {"self_attn.q_proj.weight", IN_Q_WEIGHT},
-    {"self_attn.q_proj.bias", IN_Q_BIAS},
-
-    {"self_attn.k_proj.weight", IN_K_WEIGHT},
-    {"self_attn.k_proj.bias", IN_K_BIAS},
-
-    {"self_attn.v_proj.weight", IN_V_WEIGHT},
-    {"self_attn.v_proj.bias", IN_V_BIAS},
-
-    {"self_attn.o_proj.weight", IN_ATTENTION_OUT_WEIGHT},
-
-    {"post_attention_layernorm.weight", IN_SELFOUT_NORM_WEIGHT},
-
-    // mlp
-    {"mlp.gate_up_proj.weight", IN_MLP_GATEUP_WEIGHT},
-
-    {"mlp.down_proj.weight", IN_MLP_CPROJ_WEIGHT},
-
-    {"post_self_attn_layernorm.weight", IN_SELFIN_NORM_WEIGHT},
-    {"post_mlp_layernorm.weight", IN_MLPOUT_NORM_WEIGHT}
-
-};
-
-static std::map<int, int> WEIGHT_SHARD = {{IN_Q_WEIGHT, 0},
-                                          {IN_Q_BIAS, 0},
-                                          {IN_K_WEIGHT, 0},
-                                          {IN_K_BIAS, 0},
-                                          {IN_V_WEIGHT, 0},
-                                          {IN_V_BIAS, 0},
-                                          {IN_ATTENTION_OUT_WEIGHT, 1},
-                                          {IN_MLP_GATEUP_WEIGHT, 0},
-                                          {IN_MLP_CPROJ_WEIGHT, 1}};
 
 void NpuGlm4DecoderLayerImpl::param_from_args(
     atb_speed::chatglm::ChatglmLayerParam& param,
@@ -203,49 +167,36 @@ NpuGlm4DecoderLayerImpl::NpuGlm4DecoderLayerImpl(const ModelContext& context)
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     at_weight_tensors_[i] = torch::zeros({1}).to(options);
   }
-}
-void NpuGlm4DecoderLayerImpl::verify_loaded_weights() const {
-  for (const auto& [name, index] : WEIGHT_MAPPING) {
-    CHECK(at_weight_tensors_[index].sizes() != std::vector<int64_t>({1}))
-        << "weight is not loaded for " << name;
+
+  if (FLAGS_enable_manual_loader) {
+    loader_ = std::make_unique<Glm4DecoderManualLoader>(WEIGHT_COUNT_PER_LAYER,
+                                                        context);
+  } else {
+    loader_ =
+        std::make_unique<Glm4DecoderLoader>(WEIGHT_COUNT_PER_LAYER, context);
   }
+}
+
+void NpuGlm4DecoderLayerImpl::verify_loaded_weights() const {
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->verify_loaded_weights();
 }
 
 void NpuGlm4DecoderLayerImpl::merge_loaded_weights() {
-  at_weight_tensors_[IN_Q_WEIGHT] =
-      torch::cat({at_weight_tensors_[IN_Q_WEIGHT],
-                  at_weight_tensors_[IN_K_WEIGHT],
-                  at_weight_tensors_[IN_V_WEIGHT]},
-                 0)
-          .contiguous();
-  at_weight_tensors_[IN_Q_BIAS] = torch::cat({at_weight_tensors_[IN_Q_BIAS],
-                                              at_weight_tensors_[IN_K_BIAS],
-                                              at_weight_tensors_[IN_V_BIAS]},
-                                             0)
-                                      .contiguous();
-
-  for (auto idx :
-       {IN_MLP_W1_WEIGHT, IN_K_WEIGHT, IN_V_WEIGHT, IN_K_BIAS, IN_V_BIAS}) {
-    at_weight_tensors_[idx] = at_placeholder_;
-  }
-
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
   Device::empty_cache(device_.index());
   for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
     atb_weight_tensors_[i] =
-        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors_[i]);
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
   }
-
   init_layer();
 }
 
 void NpuGlm4DecoderLayerImpl::load_state_dict(const StateDict& state_dict) {
-  for (const auto& [name, index] : WEIGHT_MAPPING) {
-    if (WEIGHT_SHARD.find(index) != WEIGHT_SHARD.end()) {
-      set_weight(state_dict, name, index, WEIGHT_SHARD[index]);
-    } else {
-      set_weight(state_dict, name, index);
-    }
-  }
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->load_state_dict(state_dict);
 }
 
 int64_t NpuGlm4DecoderLayerImpl::init_layer() {

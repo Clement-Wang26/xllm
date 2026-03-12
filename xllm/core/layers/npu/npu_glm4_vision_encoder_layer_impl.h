@@ -34,6 +34,7 @@ limitations under the License.
 #include "core/framework/model/model_args.h"
 #include "core/framework/model/model_input_params.h"
 #include "core/framework/state_dict/state_dict.h"
+#include "loader/glm4_vision_encoder_loader.h"
 #include "nlohmann/json.hpp"
 #include "npu_base_layer.h"
 #include "pytorch/adapter/utils/utils.h"
@@ -48,10 +49,6 @@ class NpuGlm4VisionEncoderLayerImpl : public BaseLayer {
   explicit NpuGlm4VisionEncoderLayerImpl(const ModelContext& context);
 
   ~NpuGlm4VisionEncoderLayerImpl() override = default;
-
-  void load_state_dict(const StateDict& state_dict) override;
-
-  void verify_loaded_weights() const override;
 
   void merge_loaded_weights() override;
 
@@ -74,8 +71,6 @@ class NpuGlm4VisionEncoderLayerImpl : public BaseLayer {
                                std::vector<int>& cu_seqlen_vec,
                                ModelInputParams& input_params,
                                bool is_prefill);
-
-  void get_weights_col_packed_qkv();
 
   void param_from_args(atb_speed::glm::VisionEncoderLayerParam& param,
                        const ModelArgs& args,

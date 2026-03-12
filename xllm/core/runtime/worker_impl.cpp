@@ -21,6 +21,8 @@ limitations under the License.
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <torch/torch.h>
+
+#include <algorithm>
 #if defined(USE_NPU)
 #include "acl/acl.h"
 #include "kernels/npu/xllm_ops/xllm_ops_api.h"

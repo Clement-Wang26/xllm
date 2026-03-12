@@ -17,11 +17,29 @@ limitations under the License.
 #include "npu_glm4_vision_encoder_layer_impl.h"
 
 #include <glog/logging.h>
+#include <mstx/ms_tools_ext.h>
 
+#include <iostream>
+
+#include "common/global_flags.h"
+#include "loader/glm4_vision_encoder_manual_loader.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUException.h"
 #include "xllm_atb_layers/models/glm4v/glm4v_encoder.h"
 
 namespace xllm {
 namespace layer {
+
+enum Glm4VisionEncoderLayerTensorId : int {
+  IN_INPUT_NORM_WEIGHT = 0,
+  IN_POST_NORM_WEIGHT,
+  IN_QKV_WEIGHT,
+  IN_ATTN_PROJ_WEIGHT,
+  IN_LINEAR_GATE_UP_WEIGHT,
+  IN_LINEAR_DOWN_WEIGHT,
+  IN_LINEAR_UP_WEIGHT,
+  IN_LINEAR_GATE_WEIGHT
+};
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 8;
 
@@ -59,10 +77,37 @@ NpuGlm4VisionEncoderLayerImpl::NpuGlm4VisionEncoderLayerImpl(
   auto parallel_args = context.get_parallel_args();
   auto options = context.get_tensor_options();
   param_from_args(encode_param_, model_args, parallel_args);
+  at_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   dtype_ = c10::typeMetaToScalarType(options.dtype());
-  loader_ = std::make_unique<Glm4VisionEncoderLoader>(WEIGHT_COUNT_PER_LAYER,
-                                                      context);
+  device_id_ = options.device().index();
+  placeholder_ =
+      atb_speed::Utils::AtTensor2Tensor(torch::zeros({1}).to(device_).to(
+          dtype_));  // seems not to be used -- HW pxy
+  at_placeholder_ = torch::zeros({1}).to(device_).to(dtype_);
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    at_weight_tensors_[i] = torch::zeros({1}).to(options);
+  }
+  if (FLAGS_enable_manual_loader) {
+    loader_ = std::make_unique<Glm4VisionEncoderManualLoader>(
+        WEIGHT_COUNT_PER_LAYER, context);
+  } else {
+    loader_ = std::make_unique<Glm4VisionEncoderLoader>(WEIGHT_COUNT_PER_LAYER,
+                                                        context);
+  }
+}
+
+void NpuGlm4VisionEncoderLayerImpl::merge_loaded_weights() {
+  CHECK(loader_ != nullptr) << "glm4 vision encoder loader is not initialized";
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  Device::empty_cache(device_.index());
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+
+  init_layer();
 }
 
 int64_t NpuGlm4VisionEncoderLayerImpl::init_layer() {

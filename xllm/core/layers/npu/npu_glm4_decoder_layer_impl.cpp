@@ -16,11 +16,80 @@ limitations under the License.
 #include "npu_glm4_decoder_layer_impl.h"
 
 #include <glog/logging.h>
+#include <mstx/ms_tools_ext.h>
 
 #include "common/global_flags.h"
+#include "loader/glm4_decoder_loader.h"
+#include "loader/glm4_decoder_manual_loader.h"
+#include "torch_npu/csrc/core/npu/NPUCachingAllocator.h"
+#include "torch_npu/csrc/core/npu/NPUException.h"
 
 namespace xllm {
 namespace layer {
+
+enum DecoderLayerTensorId : int {
+  IN_NORM_WEIGHT = 0,      // weight
+  IN_NORM_BIAS = 1,        // bias
+  IN_NORM_NEW_WEIGHT = 2,  // new weight
+  IN_NORM_NEW_BIAS = 3,    // new bias
+
+  IN_Q_WEIGHT = 4,    // weight
+  IN_Q_BIAS = 5,      // bias
+  IN_Q_DEQSCALE = 6,  // deq_scale
+  IN_Q_OFFSET = 7,    // offset
+  IN_Q_SCALE = 8,     // scale
+  IN_Q_COMPRESS_IDX = 9,
+
+  IN_K_WEIGHT = 10,    // weight
+  IN_K_BIAS = 11,      // bias
+  IN_K_DEQSCALE = 12,  // deq_scale
+  IN_K_OFFSET = 13,    // offset
+  IN_K_SCALE = 14,     // scale
+  IN_K_COMPRESS_IDX = 15,
+
+  IN_V_WEIGHT = 16,    // weight
+  IN_V_BIAS = 17,      // bias
+  IN_V_DEQSCALE = 18,  // deq_scale
+  IN_V_OFFSET = 19,    // offset
+  IN_V_SCALE = 20,     // scale
+  IN_V_COMPRESS_IDX = 21,
+
+  IN_ATTENTION_OUT_WEIGHT = 22,    // weight
+  IN_ATTENTION_OUT_BIAS = 23,      // bias
+  IN_ATTENTION_OUT_DEQSCALE = 24,  // deq_scale
+  IN_ATTENTION_OUT_OFFSET = 25,    // offset
+  IN_ATTENTION_OUT_SCALE = 26,     // scale
+  IN_ATTENTION_OUT_COMPRESS_IDX = 27,
+
+  IN_SELFOUT_NORM_WEIGHT = 28,      // weight
+  IN_SELFOUT_NORM_BIAS = 29,        // bias
+  IN_SELFOUT_NORM_NEW_WEIGHT = 30,  // new weight
+  IN_SELFOUT_NORM_NEW_BIAS = 31,    // new bias
+
+  IN_MLP_GATEUP_WEIGHT = 32,    // weight
+  IN_MLP_GATEUP_BIAS = 33,      // bias
+  IN_MLP_GATEUP_DEQSCALE = 34,  // deq_scale
+  IN_MLP_GATEUP_OFFSET = 35,    // offset
+  IN_MLP_GATEUP_SCALE = 36,     // scale
+  IN_MLP_GATEUP_COMPRESS_IDX = 37,
+
+  IN_MLP_W1_WEIGHT = 38,    // weight
+  IN_MLP_W1_BIAS = 39,      // bias
+  IN_MLP_W1_DEQSCALE = 40,  // deq_scale
+  IN_MLP_W1_OFFSET = 41,    // offset
+  IN_MLP_W1_SCALE = 42,     // scale
+  IN_MLP_W1_COMPRESS_IDX = 43,
+
+  IN_MLP_CPROJ_WEIGHT = 44,    // weight
+  IN_MLP_CPROJ_BIAS = 45,      // bias
+  IN_MLP_CPROJ_DEQSCALE = 46,  // deq_scale
+  IN_MLP_CPROJ_OFFSET = 47,    // offset
+  IN_MLP_CPROJ_SCALE = 48,     // scale
+  IN_MLP_CPROJ_COMPRESS_IDX = 49,
+
+  IN_SELFIN_NORM_WEIGHT = 50,
+  IN_MLPOUT_NORM_WEIGHT = 51
+};
 
 const uint64_t WEIGHT_COUNT_PER_LAYER = 52;
 
@@ -54,6 +123,7 @@ void NpuGlm4DecoderLayerImpl::param_from_args(
   param.linearHasBias = {true, false, false, false};
   param.useQKNorm = false;
   param.enableAclGraphPagedAttention = FLAGS_enable_graph && !isPrefill;
+
   param.numHiddenLayers = args.n_layers();
   param.usePostSelfAttnLayerNorm = true;
   param.usePostMlpLayerNorm = true;
@@ -87,14 +157,47 @@ NpuGlm4DecoderLayerImpl::NpuGlm4DecoderLayerImpl(const ModelContext& context)
 
   param_from_args(prefill_param_, model_args, parallel_args, true);
   param_from_args(decode_param_, model_args, parallel_args, false);
+  at_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   atb_weight_tensors_.resize(WEIGHT_COUNT_PER_LAYER);
   placeholder_vec_ = {1};
   dtype_ = c10::typeMetaToScalarType(options.dtype());
+  rank_id_ = parallel_args.rank();
   placeholder_ = atb_speed::Utils::AtTensor2Tensor(
       torch::zeros({1}).to(device_).to(dtype_));
   at_placeholder_ = torch::zeros({1}).to(device_).to(dtype_);
-  loader_ =
-      std::make_unique<Glm4DecoderLoader>(WEIGHT_COUNT_PER_LAYER, context);
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    at_weight_tensors_[i] = torch::zeros({1}).to(options);
+  }
+
+  if (FLAGS_enable_manual_loader) {
+    loader_ = std::make_unique<Glm4DecoderManualLoader>(WEIGHT_COUNT_PER_LAYER,
+                                                        context);
+  } else {
+    loader_ =
+        std::make_unique<Glm4DecoderLoader>(WEIGHT_COUNT_PER_LAYER, context);
+  }
+}
+
+void NpuGlm4DecoderLayerImpl::verify_loaded_weights() const {
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->verify_loaded_weights();
+}
+
+void NpuGlm4DecoderLayerImpl::merge_loaded_weights() {
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->merge_loaded_weights();
+  auto& at_weight_tensors = loader_->get_at_weight_tensors();
+  Device::empty_cache(device_.index());
+  for (int i = 0; i < WEIGHT_COUNT_PER_LAYER; ++i) {
+    atb_weight_tensors_[i] =
+        atb_speed::Utils::AtTensor2Tensor(at_weight_tensors[i]);
+  }
+  init_layer();
+}
+
+void NpuGlm4DecoderLayerImpl::load_state_dict(const StateDict& state_dict) {
+  CHECK(loader_ != nullptr) << "glm4 decoder loader is not initialized";
+  loader_->load_state_dict(state_dict);
 }
 
 int64_t NpuGlm4DecoderLayerImpl::init_layer() {
@@ -223,10 +326,11 @@ void NpuGlm4DecoderLayerImpl::build_node_variant_pack(
   size_t input_idx = WEIGHT_COUNT_PER_LAYER + 11;
   if (is_prefill &&
       (FLAGS_enable_chunked_prefill || FLAGS_enable_prefix_cache)) {
-    node.variantPack.inTensors.at(input_idx++) =
+    node.variantPack.inTensors.at(input_idx) =
         atb_speed::Utils::AtTensor2Tensor(input_params.q_seq_lens);
-    node.variantPack.inTensors.at(input_idx - 1).hostData =
+    node.variantPack.inTensors.at(input_idx).hostData =
         input_params.q_seq_lens_vec.data();
+    ++input_idx;
   }
 
   if (FLAGS_enable_graph && !is_prefill &&

@@ -21,6 +21,7 @@ limitations under the License.
 #include <atomic>
 #include <boost/algorithm/string.hpp>
 #include <csignal>
+#include <filesystem>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -38,6 +39,7 @@ limitations under the License.
 #include "rec_master.h"
 #include "speculative_engine.h"
 #include "util/device_name_utils.h"
+#include "util/model_type_utils.h"
 #include "util/scope_guard.h"
 #include "util/timer.h"
 #include "vlm_engine.h"
@@ -50,9 +52,33 @@ DECLARE_bool(graceful_quit_on_sighup);
 
 namespace xllm {
 
+namespace {
+
+bool infer_enable_mla(const Options& options, bool fallback_enable_mla) {
+  if (options.backend() == "dit") {
+    return false;
+  }
+  if (options.model_path().empty()) {
+    return fallback_enable_mla;
+  }
+
+  const auto model_path =
+      std::filesystem::path(options.model_path()).lexically_normal();
+  const auto model_type = util::try_get_model_type_from_config(model_path);
+  if (!model_type.has_value()) {
+    LOG(WARNING) << "Failed to infer model_type for " << options.model_path()
+                 << ", keep enable_mla=" << fallback_enable_mla;
+    return fallback_enable_mla;
+  }
+  return util::is_mla_model_type(model_type.value());
+}
+
+}  // namespace
+
 Master::Master(const Options& options, EngineType type)
     : options_(options), master_status_(options.master_status()) {
   LOG(INFO) << "Master init options: " << options.to_string();
+  FLAGS_enable_mla = options.enable_mla();
 
   // Allow brpc receive SIGTREM and SIGINT signal.
   brpc::FLAGS_graceful_quit_on_sigterm = true;
@@ -334,6 +360,11 @@ std::unique_ptr<Master> fork_master(Master* master, const Options& options) {
   new_options.master_node_addr() = options.master_node_addr();
   new_options.server_idx() = server_idx++;
   new_options.master_status() = options.master_status();
+  const bool prev_enable_mla = new_options.enable_mla();
+  new_options.enable_mla() = infer_enable_mla(new_options, prev_enable_mla);
+  LOG(INFO) << "fork master resolved enable_mla=" << new_options.enable_mla()
+            << " for model_id=" << new_options.model_id()
+            << ", model_path=" << new_options.model_path();
   // Set nnodes and dp_size from fork request (tp_size * dp_size = nnodes)
   if (options.nnodes() > 0 && new_options.nnodes() >= options.nnodes()) {
     new_options.nnodes() = options.nnodes();

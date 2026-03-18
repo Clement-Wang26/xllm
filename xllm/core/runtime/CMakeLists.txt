@@ -143,6 +143,23 @@ cc_test(
     GTest::gtest_main
 )
 
+cc_test(
+  NAME
+    xtensor_phase_d_test
+  SRCS
+    xtensor_phase_d_test.cpp
+  DEPS
+    :runtime
+    :distributed_runtime
+    :xllm_server
+    GTest::gtest_main
+)
+
+# Resolve the xtensor <-> xllm_server static link cycle pulled in via
+# distributed_runtime when the regression test exercises xtensor internals.
+target_link_libraries(xtensor_phase_d_test PRIVATE
+  "$<LINK_GROUP:RESCAN,xtensor,xllm_server>")
+
 if(USE_MLU)
 cc_test(
   NAME

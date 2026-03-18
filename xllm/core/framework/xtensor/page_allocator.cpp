@@ -73,10 +73,13 @@ PageAllocator::~PageAllocator() {
 
 bool PageAllocator::register_model(const std::string& model_id,
                                    int64_t num_layers,
-                                   MasterStatus master_status) {
+                                   MasterStatus master_status,
+                                   const XTensorKvPageLayout& kv_layout) {
+  (void)master_status;
   std::lock_guard<std::mutex> lock(mtx_);
 
   CHECK(initialized_) << "PageAllocator not initialized";
+  CHECK(kv_layout.valid()) << "Invalid KV layout for model " << model_id;
 
   if (model_states_.find(model_id) != model_states_.end()) {
     LOG(WARNING) << "Model " << model_id << " already registered";
@@ -86,10 +89,12 @@ bool PageAllocator::register_model(const std::string& model_id,
   // Create state directly in map to avoid atomic assignment issues
   auto& state = model_states_[model_id];
   state.num_layers = num_layers;
-  // Calculate virtual pages based on single-layer memory size
-  state.num_total_virt_pages = num_total_phy_pages_ / num_layers / 2;
-  // Each virt_page needs to map on all K and V XTensors
-  state.phy_pages_per_virt_page = 2 * num_layers;
+  state.kv_layout = kv_layout;
+  state.blocks_per_virt_page = kv_layout.blocks_per_virt_page;
+  state.phy_pages_per_virt_page = static_cast<size_t>(num_layers) *
+                                  kv_layout.total_tensor_pages_per_virt_page();
+  state.num_total_virt_pages =
+      get_num_xtensor_virt_pages(num_total_phy_pages_, num_layers, kv_layout);
   // Always start with is_sleeping = false to allow KV cache allocation
   // If sleeping is needed, call sleep_model after initialization
   state.is_sleeping = false;
@@ -108,7 +113,13 @@ bool PageAllocator::register_model(const std::string& model_id,
             << "num_layers=" << num_layers << ", num_total_virt_pages="
             << model_states_[model_id].num_total_virt_pages
             << ", phy_pages_per_virt_page="
-            << model_states_[model_id].phy_pages_per_virt_page;
+            << model_states_[model_id].phy_pages_per_virt_page
+            << ", blocks_per_virt_page="
+            << model_states_[model_id].blocks_per_virt_page
+            << ", k_pages_per_virt_page=" << kv_layout.k_pages_per_virt_page
+            << ", v_pages_per_virt_page=" << kv_layout.v_pages_per_virt_page
+            << ", index_pages_per_virt_page="
+            << kv_layout.index_pages_per_virt_page;
 
   return true;
 }
@@ -876,13 +887,18 @@ std::vector<size_t> PageAllocator::get_all_worker_free_pages() const {
   return result;
 }
 
-int64_t PageAllocator::get_virt_page_id(int64_t block_id,
-                                        size_t block_mem_size) const {
-  return block_id * block_mem_size / page_size_;
+int64_t PageAllocator::get_virt_page_id(const std::string& model_id,
+                                        int64_t block_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  const ModelState& state = get_model_state(model_id);
+  CHECK_GT(state.blocks_per_virt_page, 0)
+      << "Invalid blocks_per_virt_page for model " << model_id;
+  return block_id / state.blocks_per_virt_page;
 }
 
 offset_t PageAllocator::get_offset(int64_t virt_page_id) const {
-  // Offset for single-layer XTensor map/unmap
+  // Logical base offset for one virt_page; XTensorAllocator expands this into
+  // per-tensor page spans.
   return virt_page_id * page_size_;
 }
 
@@ -897,6 +913,12 @@ size_t PageAllocator::phy_pages_per_virt_page(
   std::lock_guard<std::mutex> lock(mtx_);
   const ModelState& state = get_model_state(model_id);
   return state.phy_pages_per_virt_page;
+}
+
+size_t PageAllocator::blocks_per_virt_page(const std::string& model_id) const {
+  std::lock_guard<std::mutex> lock(mtx_);
+  const ModelState& state = get_model_state(model_id);
+  return state.blocks_per_virt_page;
 }
 
 void PageAllocator::prealloc_worker() {
@@ -1104,7 +1126,7 @@ void PageAllocator::trigger_preallocation() {
 bool PageAllocator::map_virt_pages(const std::string& model_id,
                                    int32_t dp_rank,
                                    const std::vector<int64_t>& virt_page_ids) {
-  // Convert virtual page IDs to offsets (for single-layer XTensor)
+  // Convert virtual page IDs to logical offsets understood by XTensorAllocator.
   std::vector<offset_t> offsets;
   offsets.reserve(virt_page_ids.size());
 
@@ -1126,7 +1148,7 @@ bool PageAllocator::unmap_virt_pages(
     const std::string& model_id,
     int32_t dp_rank,
     const std::vector<int64_t>& virt_page_ids) {
-  // Convert virtual page IDs to offsets (for single-layer XTensor)
+  // Convert virtual page IDs to logical offsets understood by XTensorAllocator.
   std::vector<offset_t> offsets;
   offsets.reserve(virt_page_ids.size());
 

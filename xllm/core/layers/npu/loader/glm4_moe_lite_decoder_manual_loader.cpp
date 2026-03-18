@@ -594,7 +594,11 @@ torch::Tensor Glm4MoeDecoderLiteManualLoader::merge_experts_weights(
     merged_tensor = merged_tensor.transpose(1, 2);
   }
   merged_tensor = merged_tensor.contiguous();
-  experts.clear();
+  // Reset to initial slot state for next load cycle while releasing tensor
+  // storage referenced by intermediate expert tensors.
+  for (auto& expert : experts) {
+    expert = torch::Tensor();
+  }
 
   return merged_tensor;
 }
@@ -611,8 +615,14 @@ torch::Tensor Glm4MoeDecoderLiteManualLoader::merge_experts_weights(
     merged_tensor = merged_tensor.transpose(1, 2);
   }
   merged_tensor = merged_tensor.contiguous();
-  experts_gate.clear();
-  experts_up.clear();
+  // Reset to initial slot state for next load cycle while releasing tensor
+  // storage referenced by intermediate expert tensors.
+  for (auto& expert : experts_gate) {
+    expert = torch::Tensor();
+  }
+  for (auto& expert : experts_up) {
+    expert = torch::Tensor();
+  }
 
   return merged_tensor;
 }

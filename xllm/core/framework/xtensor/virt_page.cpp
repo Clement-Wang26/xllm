@@ -46,6 +46,20 @@ void VirtPage::init(size_t block_mem_size) {
   }
 }
 
+void VirtPage::init_fixed_blocks(size_t blocks_per_page) {
+  CHECK_GT(blocks_per_page, 0) << "blocks_per_page must be > 0";
+
+  start_block_ = page_id_ * static_cast<int64_t>(blocks_per_page);
+  end_block_ = *start_block_ + static_cast<int64_t>(blocks_per_page);
+  num_kv_blocks_ = blocks_per_page;
+
+  free_list_.clear();
+  free_list_.reserve(*num_kv_blocks_);
+  for (int64_t i = *start_block_; i < *end_block_; ++i) {
+    free_list_.push_back(i);
+  }
+}
+
 std::vector<int64_t> VirtPage::alloc(size_t num_blocks) {
   require_init();
   if (full()) {

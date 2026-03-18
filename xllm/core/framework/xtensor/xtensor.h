@@ -101,6 +101,7 @@ class XTensor {
   // This is used for PD disaggregation to convert block offsets to
   // GlobalXTensor offsets.
   page_id_t get_phy_page_id(offset_t offset) const;
+  bool is_mapped(offset_t offset) const;
 
  private:
   // Map a single physical page at the given offset

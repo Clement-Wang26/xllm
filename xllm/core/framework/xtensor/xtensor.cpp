@@ -317,6 +317,12 @@ page_id_t XTensor::get_phy_page_id(offset_t offset) const {
   return it->second->page_id();
 }
 
+bool XTensor::is_mapped(offset_t offset) const {
+  CHECK(offset % page_size_ == 0)
+      << "Offset not aligned to page size: " << offset;
+  return mapping_.find(offset / page_size_) != mapping_.end();
+}
+
 torch::Tensor XTensor::to_torch_tensor(size_t offset,
                                        const std::vector<int64_t>& dims) const {
   uintptr_t addr = vir_ptr_to_uintptr(vaddr_) + offset;

@@ -199,15 +199,33 @@ bool WorkerImpl::allocate_kv_cache(
     // Create V tensors for all layers
     auto v_tensors = allocator.create_v_tensors(
         model_id, kv_cache_shape[1], dtype_, num_layers);
+    std::vector<torch::Tensor> index_tensors;
+    if (enable_lighting_indexer) {
+      index_tensors = allocator.create_index_tensors(
+          model_id, kv_cache_shape[2], dtype_, num_layers);
+    }
 
     for (int64_t i = 0; i < num_layers; ++i) {
       auto k_tensor = k_tensors[i];
       auto v_tensor = v_tensors[i];
+      torch::Tensor index_tensor;
 #if defined(USE_NPU)
       k_tensor = at_npu::native::npu_format_cast(k_tensor, ACL_FORMAT_ND);
       v_tensor = at_npu::native::npu_format_cast(v_tensor, ACL_FORMAT_ND);
+      if (enable_lighting_indexer) {
+        index_tensor =
+            at_npu::native::npu_format_cast(index_tensors[i], ACL_FORMAT_ND);
+      }
+#else
+      if (enable_lighting_indexer) {
+        index_tensor = index_tensors[i];
+      }
 #endif
-      kv_caches_.emplace_back(k_tensor, v_tensor);
+      if (enable_lighting_indexer) {
+        kv_caches_.emplace_back(k_tensor, v_tensor, index_tensor);
+      } else {
+        kv_caches_.emplace_back(k_tensor, v_tensor);
+      }
     }
   } else {
     // Original mode: create torch tensors with optional int8 kv quantization.

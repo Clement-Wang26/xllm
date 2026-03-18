@@ -29,7 +29,7 @@ namespace xllm {
 
 XTensorBlockManagerImpl::XTensorBlockManagerImpl(const Options& options,
                                                  int64_t num_layers,
-                                                 size_t block_mem_size,
+                                                 size_t blocks_per_virt_page,
                                                  size_t page_size,
                                                  int32_t dp_rank,
                                                  const std::string& model_id)
@@ -38,13 +38,13 @@ XTensorBlockManagerImpl::XTensorBlockManagerImpl(const Options& options,
       dp_rank_(dp_rank),
       num_layers_(num_layers),
       page_size_(page_size),
-      block_mem_size_(block_mem_size),
+      blocks_per_virt_page_(blocks_per_virt_page),
       num_avail_blocks_(0) {
   LOG(INFO) << "XTensorBlockManagerImpl initialized: "
             << "model_id=" << model_id_ << ", dp_rank=" << dp_rank_
             << ", num_layers=" << num_layers_ << ", page_size=" << page_size_
             << ", block_size=" << options.block_size()
-            << ", block_mem_size=" << block_mem_size_
+            << ", blocks_per_virt_page=" << blocks_per_virt_page_
             << ", num_blocks=" << options.num_blocks();
 }
 
@@ -117,7 +117,7 @@ std::vector<int32_t> XTensorBlockManagerImpl::alloc_internal(size_t need_size) {
         // allocation)
         return ret_index;
       }
-      new_page->init(block_mem_size_);
+      new_page->init_fixed_blocks(blocks_per_virt_page_);
       num_avail_blocks_ += new_page->num_free_blocks();
       int64_t page_id = new_page->page_id();
       avail_pages_[page_id] = std::move(new_page);
@@ -178,7 +178,7 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
   // Group indices by page_id
   std::unordered_map<int64_t, std::vector<int64_t>> idx_dict;
   for (int32_t idx : indices) {
-    int64_t page_id = page_allocator.get_virt_page_id(idx, block_mem_size_);
+    int64_t page_id = page_allocator.get_virt_page_id(model_id_, idx);
     idx_dict[page_id].push_back(static_cast<int64_t>(idx));
   }
   std::vector<int64_t> pages_to_free;
@@ -205,7 +205,7 @@ void XTensorBlockManagerImpl::free_blocks(const std::vector<int32_t>& indices) {
           << "Skipping to avoid crash, but this indicates a serious bug. "
           << "avail_pages size: " << avail_pages_.size() << ", "
           << "full_pages size: " << full_pages_.size() << ", "
-          << "block_mem_size: " << block_mem_size_ << ", "
+          << "blocks_per_virt_page: " << blocks_per_virt_page_ << ", "
           << "page_size: " << page_allocator.page_size();
       continue;
     }
@@ -303,8 +303,7 @@ size_t XTensorBlockManagerImpl::available_size_internal() const {
   auto& page_allocator = PageAllocator::get_instance();
   size_t reserved_pages =
       page_allocator.get_num_reserved_virt_pages(model_id_, dp_rank_);
-  size_t blocks_from_reserved_pages =
-      reserved_pages * VirtPage::get_num_blocks(page_size_, block_mem_size_);
+  size_t blocks_from_reserved_pages = reserved_pages * blocks_per_virt_page_;
 
   return avail_blocks + blocks_from_reserved_pages;
 }
@@ -363,16 +362,14 @@ size_t XTensorBlockManagerImpl::get_mapped_memory_size() const {
 
 size_t XTensorBlockManagerImpl::get_num_allocated_blocks() const {
   // Blocks from fully allocated pages
-  size_t blocks_per_page =
-      VirtPage::get_num_blocks(page_size_, block_mem_size_);
-  size_t blocks_from_full_pages = full_pages_.size() * blocks_per_page;
+  size_t blocks_from_full_pages = full_pages_.size() * blocks_per_virt_page_;
 
   // Blocks from partially allocated pages
   // num_avail_blocks is the number of free blocks in the partially allocated
   // pages so the number of allocated blocks is the total number of blocks in
   // the partially allocated pages minus the number of free blocks.
   size_t blocks_from_avail_pages =
-      avail_pages_.size() * blocks_per_page - num_avail_blocks_.load();
+      avail_pages_.size() * blocks_per_virt_page_ - num_avail_blocks_.load();
 
   // Blocks from reserved blocks
   size_t blocks_from_reserved = reserved_blocks_.size();

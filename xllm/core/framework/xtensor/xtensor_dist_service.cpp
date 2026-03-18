@@ -249,38 +249,39 @@ void XTensorDistService::GetXTensorOffsets(
       return;
     }
 
-    // Get model tensors to determine number of layers
-    auto* tensors = allocator.get_model_tensors(model_id);
-    if (!tensors) {
-      LOG(ERROR) << "Model " << model_id << " not found in XTensorAllocator";
+    std::vector<XTensorLayerOffsets> layer_offsets;
+    XTensorBlockBytes block_bytes;
+    if (!allocator.get_xtensor_offsets(
+            /*dp_rank=*/0,
+            model_id,
+            block_ids,
+            block_size_bytes,
+            layer_offsets,
+            &block_bytes)) {
+      LOG(ERROR) << "Failed to get xtensor offsets for model " << model_id;
       return;
     }
 
-    int64_t num_layers = tensors->num_layers;
-
-    // Calculate offsets for each layer and each block
-    for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
+    for (const auto& layer_offsets_item : layer_offsets) {
       auto* layer_offsets_proto = response->add_layer_offsets();
-
-      for (const auto& block_id : block_ids) {
-        auto [k_offset, v_offset] = allocator.get_global_offsets_for_block(
-            model_id, layer_id, block_id, block_size_bytes);
-
-        if (k_offset == UINT64_MAX || v_offset == UINT64_MAX) {
-          LOG(ERROR) << "Failed to get offsets for block " << block_id
-                     << " at layer " << layer_id << " for model " << model_id;
-          response->clear_layer_offsets();
-          return;
-        }
-
+      for (const auto k_offset : layer_offsets_item.k_offsets) {
         layer_offsets_proto->add_k_offsets(k_offset);
+      }
+      for (const auto v_offset : layer_offsets_item.v_offsets) {
         layer_offsets_proto->add_v_offsets(v_offset);
       }
+      for (const auto index_offset : layer_offsets_item.index_offsets) {
+        layer_offsets_proto->add_index_offsets(index_offset);
+      }
     }
+    auto* block_bytes_proto = response->mutable_block_bytes();
+    block_bytes_proto->set_k_block_bytes(block_bytes.k_block_bytes);
+    block_bytes_proto->set_v_block_bytes(block_bytes.v_block_bytes);
+    block_bytes_proto->set_index_block_bytes(block_bytes.index_block_bytes);
 
     VLOG(1) << "GetXTensorOffsets: model_id=" << model_id
             << ", num_blocks=" << block_ids.size()
-            << ", num_layers=" << num_layers;
+            << ", num_layers=" << layer_offsets.size();
   });
 }
 

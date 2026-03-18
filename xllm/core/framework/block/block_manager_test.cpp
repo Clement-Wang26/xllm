@@ -17,6 +17,7 @@ limitations under the License.
 #include <gtest/gtest.h>
 
 #include "block_manager_impl.h"
+#include "framework/xtensor/xtensor_kv_layout.h"
 
 namespace xllm {
 
@@ -117,6 +118,38 @@ TEST(BlockManagerTest, Basic) {
     }
     EXPECT_FALSE(block.is_valid());
   }
+}
+
+TEST(BlockManagerTest, XTensorLayoutKeepsLegacyStandardAttentionPacking) {
+  constexpr uint64_t kPageSize = 2UL * 1024 * 1024;
+  constexpr uint64_t kTensorBlockBytes = 16UL * 1024;
+
+  const auto layout =
+      build_xtensor_kv_layout(kPageSize, kTensorBlockBytes, kTensorBlockBytes);
+
+  ASSERT_TRUE(layout.valid());
+  EXPECT_EQ(layout.blocks_per_virt_page, 128);
+  EXPECT_EQ(layout.k_pages_per_virt_page, 1);
+  EXPECT_EQ(layout.v_pages_per_virt_page, 1);
+  EXPECT_EQ(layout.index_pages_per_virt_page, 0);
+}
+
+TEST(BlockManagerTest, XTensorLayoutFindsDenserMlaPacking) {
+  constexpr uint64_t kPageSize = 2UL * 1024 * 1024;
+  constexpr uint64_t kBlockBytes = 16UL * 1024;
+  constexpr uint64_t vBlockBytes = 4UL * 1024;
+
+  const auto layout =
+      build_xtensor_kv_layout(kPageSize, kBlockBytes, vBlockBytes);
+
+  ASSERT_TRUE(layout.valid());
+  EXPECT_EQ(layout.blocks_per_virt_page, 512);
+  EXPECT_EQ(layout.k_pages_per_virt_page, 4);
+  EXPECT_EQ(layout.v_pages_per_virt_page, 1);
+
+  const uint64_t num_blocks = get_num_xtensor_blocks(
+      /*num_phy_pages=*/1024, /*num_layers=*/2, layout);
+  EXPECT_EQ(num_blocks, 52224);
 }
 
 }  // namespace xllm

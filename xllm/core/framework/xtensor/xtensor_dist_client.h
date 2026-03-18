@@ -25,6 +25,7 @@ limitations under the License.
 #include <vector>
 
 #include "common/macros.h"
+#include "common/types.h"
 #include "util/threadpool.h"
 #include "xtensor.h"  // For offset_t type definition
 #include "xtensor_dist.pb.h"
@@ -68,14 +69,13 @@ class XTensorDistClient {
   folly::SemiFuture<bool> free_weight_pages_async(const std::string& model_id);
 
   // Get XTensor offsets for KV cache blocks (used in PD disaggregation)
-  // Returns per-layer K/V offsets for each block
-  // Result: layer_offsets[layer_id] = {k_offsets, v_offsets}
-  // Returns empty vector on error
-  folly::SemiFuture<
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>>
-  get_xtensor_offsets_async(const std::string& model_id,
-                            const std::vector<int32_t>& block_ids,
-                            uint64_t block_size_bytes);
+  // Returns per-layer offsets for each block plus per-tensor block bytes.
+  // `index_offsets` and `index_block_bytes` are optional.
+  // Returns an empty `layer_offsets` vector on error.
+  folly::SemiFuture<XTensorOffsetsResponse> get_xtensor_offsets_async(
+      const std::string& model_id,
+      const std::vector<int32_t>& block_ids,
+      uint64_t block_size_bytes);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(XTensorDistClient);

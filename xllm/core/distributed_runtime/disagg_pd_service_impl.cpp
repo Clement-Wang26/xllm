@@ -178,20 +178,28 @@ void DisaggPDServiceImpl::decode_recv_new_requests(
       }
       // XTensor mode: calculate and return GlobalXTensor offsets
       if (FLAGS_enable_xtensor && !block_ids.empty()) {
-        std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>
-            layer_offsets;
+        std::vector<XTensorLayerOffsets> layer_offsets;
+        XTensorBlockBytes block_bytes;
         if (engine_->get_xtensor_offsets_for_blocks(
-                dp_rank, block_ids, layer_offsets)) {
+                dp_rank, block_ids, layer_offsets, &block_bytes)) {
           // Fill proto with per-layer offsets
-          for (const auto& [k_offsets, v_offsets] : layer_offsets) {
+          for (const auto& layer_offsets_item : layer_offsets) {
             auto* layer_proto = resp->add_xtensor_layer_offsets();
-            for (const auto& k_off : k_offsets) {
+            for (const auto& k_off : layer_offsets_item.k_offsets) {
               layer_proto->add_k_offsets(k_off);
             }
-            for (const auto& v_off : v_offsets) {
+            for (const auto& v_off : layer_offsets_item.v_offsets) {
               layer_proto->add_v_offsets(v_off);
             }
+            for (const auto& index_off : layer_offsets_item.index_offsets) {
+              layer_proto->add_index_offsets(index_off);
+            }
           }
+          auto* block_bytes_proto = resp->mutable_xtensor_block_bytes();
+          block_bytes_proto->set_k_block_bytes(block_bytes.k_block_bytes);
+          block_bytes_proto->set_v_block_bytes(block_bytes.v_block_bytes);
+          block_bytes_proto->set_index_block_bytes(
+              block_bytes.index_block_bytes);
           VLOG(5) << "XTensor offsets added for request " << req.req_id()
                   << ", num_blocks=" << block_ids.size()
                   << ", num_layers=" << layer_offsets.size();

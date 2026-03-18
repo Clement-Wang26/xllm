@@ -850,12 +850,33 @@ void PDOOCScheduler::dispatch_requests() {
         for (auto& sequence : requests[i]->sequences()) {
           TransferKVInfo info;
           info.request_id = requests[i]->request_id();
+          const auto& resp = resps.resps()[i];
           for (auto& bid : resps.resps()[i].blocks_ids()) {
             info.remote_blocks_ids.emplace_back(bid);
           }
           info.dp_rank = resps.resps()[i].dp_rank();
           // TODO: remote_instances_info_ is not multi-thread safe.
           info.remote_instance_info = remote_instances_info_[selected_instance];
+          if (resp.xtensor_layer_offsets_size() > 0) {
+            info.dst_xtensor_layer_offsets.reserve(
+                resp.xtensor_layer_offsets_size());
+            for (const auto& layer_offsets : resp.xtensor_layer_offsets()) {
+              XTensorLayerOffsets layer;
+              layer.k_offsets.assign(layer_offsets.k_offsets().begin(),
+                                     layer_offsets.k_offsets().end());
+              layer.v_offsets.assign(layer_offsets.v_offsets().begin(),
+                                     layer_offsets.v_offsets().end());
+              layer.index_offsets.assign(layer_offsets.index_offsets().begin(),
+                                         layer_offsets.index_offsets().end());
+              info.dst_xtensor_layer_offsets.emplace_back(std::move(layer));
+            }
+            info.dst_xtensor_block_bytes.k_block_bytes =
+                resp.xtensor_block_bytes().k_block_bytes();
+            info.dst_xtensor_block_bytes.v_block_bytes =
+                resp.xtensor_block_bytes().v_block_bytes();
+            info.dst_xtensor_block_bytes.index_block_bytes =
+                resp.xtensor_block_bytes().index_block_bytes();
+          }
           sequence->kv_state().set_transfer_kv_info(std::move(info));
         }
 
@@ -1252,11 +1273,32 @@ void PDOOCScheduler::dispatch_offline_requests() {
       for (auto& sequence : request->sequences()) {
         TransferKVInfo info;
         info.request_id = request->request_id();
+        const auto& resp = resps.resps()[0];
         for (auto& bid : resps.resps()[0].blocks_ids()) {
           info.remote_blocks_ids.emplace_back(bid);
         }
         info.dp_rank = resps.resps()[0].dp_rank();
         info.remote_instance_info = remote_instances_info_[target_instance];
+        if (resp.xtensor_layer_offsets_size() > 0) {
+          info.dst_xtensor_layer_offsets.reserve(
+              resp.xtensor_layer_offsets_size());
+          for (const auto& layer_offsets : resp.xtensor_layer_offsets()) {
+            XTensorLayerOffsets layer;
+            layer.k_offsets.assign(layer_offsets.k_offsets().begin(),
+                                   layer_offsets.k_offsets().end());
+            layer.v_offsets.assign(layer_offsets.v_offsets().begin(),
+                                   layer_offsets.v_offsets().end());
+            layer.index_offsets.assign(layer_offsets.index_offsets().begin(),
+                                       layer_offsets.index_offsets().end());
+            info.dst_xtensor_layer_offsets.emplace_back(std::move(layer));
+          }
+          info.dst_xtensor_block_bytes.k_block_bytes =
+              resp.xtensor_block_bytes().k_block_bytes();
+          info.dst_xtensor_block_bytes.v_block_bytes =
+              resp.xtensor_block_bytes().v_block_bytes();
+          info.dst_xtensor_block_bytes.index_block_bytes =
+              resp.xtensor_block_bytes().index_block_bytes();
+        }
         sequence->kv_state().set_transfer_kv_info(std::move(info));
       }
 

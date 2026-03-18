@@ -17,13 +17,16 @@ limitations under the License.
 
 #include <folly/futures/Future.h>
 
+#include <algorithm>
 #include <unordered_map>
 
+#include "common/types.h"
 #include "framework/batch/batch.h"
 #include "framework/block/block_manager_pool.h"
 #include "framework/model/model_args.h"
 #include "framework/tokenizer/tokenizer.h"
 #include "framework/tokenizer/tokenizer_args.h"
+#include "framework/xtensor/xtensor_kv_layout.h"
 #include "runtime/options.h"
 
 namespace xllm {
@@ -162,15 +165,15 @@ class Engine {
   };
 
   // XTensor mode: get GlobalXTensor offsets for allocated blocks
-  // Returns per-layer K/V offsets for each block
-  // Output: offsets[layer_id] = {k_offsets, v_offsets}
+  // Returns per-layer offsets for each block.
+  // `index_offsets` is optional and populated when MLA index tensors exist.
   // dp_rank: Target DP rank to query (offsets come from workers in that DP
   // group)
   virtual bool get_xtensor_offsets_for_blocks(
       int32_t dp_rank,
       const std::vector<int32_t>& block_ids,
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
-          layer_offsets) {
+      std::vector<XTensorLayerOffsets>& layer_offsets,
+      XTensorBlockBytes* block_bytes = nullptr) {
     return false;
   };
 
@@ -180,7 +183,9 @@ class Engine {
     int64_t cache_size_in_bytes = 0;
     int64_t slot_size = 0;
     int64_t index_slot_size = 0;
+    int64_t extra_slot_size = 0;
     int64_t n_layers = 0;
+    XTensorKvPageLayout xtensor_kv_layout;
   };
 
  protected:
@@ -197,4 +202,67 @@ class Engine {
   // tokenizer
   std::unique_ptr<Tokenizer> tokenizer_;
 };
+
+inline uint64_t get_kv_cache_required_bytes(
+    const Engine::KVCacheCapacity& kv_cache_cap,
+    int32_t block_size,
+    int64_t n_blocks,
+    uint64_t page_size = 0) {
+  if (n_blocks <= 0) {
+    return 0;
+  }
+
+  if (kv_cache_cap.xtensor_kv_layout.valid()) {
+    if (page_size == 0) {
+      return 0;
+    }
+    const auto& layout = kv_cache_cap.xtensor_kv_layout;
+    const uint64_t virt_pages =
+        (static_cast<uint64_t>(n_blocks) + layout.blocks_per_virt_page - 1) /
+        layout.blocks_per_virt_page;
+    return virt_pages * static_cast<uint64_t>(kv_cache_cap.n_layers) *
+           layout.total_tensor_pages_per_virt_page() * page_size;
+  }
+
+  const uint64_t bytes_per_block =
+      static_cast<uint64_t>(block_size) *
+      static_cast<uint64_t>(kv_cache_cap.n_layers) *
+      static_cast<uint64_t>(kv_cache_cap.slot_size +
+                            kv_cache_cap.index_slot_size +
+                            kv_cache_cap.extra_slot_size);
+  return static_cast<uint64_t>(n_blocks) * bytes_per_block;
+}
+
+inline int64_t calculate_shared_kv_cache_blocks(
+    int64_t cache_size_in_bytes,
+    const Engine::KVCacheCapacity& target_kv_cache_cap,
+    const Engine::KVCacheCapacity& draft_kv_cache_cap,
+    int32_t block_size,
+    uint64_t page_size = 0) {
+  if (cache_size_in_bytes <= 0) {
+    return 0;
+  }
+
+  int64_t low = 0;
+  int64_t high =
+      std::min(target_kv_cache_cap.n_blocks, draft_kv_cache_cap.n_blocks);
+  const unsigned __int128 cache_budget =
+      static_cast<unsigned __int128>(cache_size_in_bytes);
+
+  while (low < high) {
+    const int64_t mid = low + (high - low + 1) / 2;
+    const unsigned __int128 required =
+        static_cast<unsigned __int128>(get_kv_cache_required_bytes(
+            target_kv_cache_cap, block_size, mid, page_size)) +
+        static_cast<unsigned __int128>(get_kv_cache_required_bytes(
+            draft_kv_cache_cap, block_size, mid, page_size));
+    if (required <= cache_budget) {
+      low = mid;
+    } else {
+      high = mid - 1;
+    }
+  }
+
+  return low;
+}
 }  // namespace xllm

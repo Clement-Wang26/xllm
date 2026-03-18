@@ -36,6 +36,7 @@ limitations under the License.
 #include "core/framework/xtensor/xtensor_allocator.h"
 #include "core/util/device_name_utils.h"
 #include "core/util/json_reader.h"
+#include "core/util/model_type_utils.h"
 #include "core/util/net.h"
 #include "core/util/utils.h"
 #include "function_call/function_call_parser.h"
@@ -45,18 +46,6 @@ limitations under the License.
 using namespace xllm;
 
 static std::atomic<uint32_t> signal_received{0};
-
-static std::unordered_set<std::string> deepseek_like_model_set = {
-    "deepseek_v2",
-    "deepseek_v3",
-    "deepseek_v32",
-    "deepseek_v3_mtp",
-    "deepseek_v32_mtp",
-    "kimi_k2",
-    "glm4_moe_lite",
-    "glm5_moe",
-    "glm_moe_dsa",
-    "joyai_llm_flash"};
 
 void shutdown_handler(int signal) {
   // TODO: gracefully shutdown the server
@@ -89,6 +78,7 @@ std::string get_model_type(const std::filesystem::path& model_path) {
                   "them should exist in the model path: "
                << model_path;
   }
+  return "";
 }
 
 std::string get_model_backend(const std::filesystem::path& model_path) {
@@ -213,12 +203,7 @@ int run() {
   std::string model_type = get_model_type(model_path);
   // set enable_mla by model type
   if (FLAGS_backend != "dit") {
-    if (deepseek_like_model_set.find(model_type) !=
-        deepseek_like_model_set.end()) {
-      FLAGS_enable_mla = true;
-    } else {
-      FLAGS_enable_mla = false;
-    }
+    FLAGS_enable_mla = xllm::util::is_mla_model_type(model_type);
   }
   FLAGS_tool_call_parser = function_call::FunctionCallParser::get_parser_auto(
       FLAGS_tool_call_parser, model_type);

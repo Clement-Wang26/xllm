@@ -130,8 +130,8 @@ class LLMEngine : public Engine {
   bool get_xtensor_offsets_for_blocks(
       int32_t dp_rank,
       const std::vector<int32_t>& block_ids,
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
-          layer_offsets) override;
+      std::vector<XTensorLayerOffsets>& layer_offsets,
+      XTensorBlockBytes* block_bytes = nullptr) override;
 
  private:
   friend class SpeculativeEngine;

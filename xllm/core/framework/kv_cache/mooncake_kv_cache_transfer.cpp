@@ -17,6 +17,8 @@ limitations under the License.
 
 #include <glog/logging.h>
 
+#include <limits>
+
 #if defined(USE_NPU)
 #ifdef TORCH_HIGHER_THAN_PTA6
 #include <torch_npu/csrc/core/npu/NPUFormat.h>
@@ -316,6 +318,12 @@ void MooncakeKVCacheTransferXTensor::allocate_kv_cache_xtensor(
       model_id_, kv_cache_shape[0], dtype, num_layers);
   auto v_tensors = allocator.create_v_tensors(
       model_id_, kv_cache_shape[1], dtype, num_layers);
+  std::vector<torch::Tensor> index_tensors;
+  const bool enable_index_tensor = kv_cache_shape.size() > 2;
+  if (enable_index_tensor) {
+    index_tensors = allocator.create_index_tensors(
+        model_id_, kv_cache_shape[2], dtype, num_layers);
+  }
 
   for (int64_t i = 0; i < num_layers; ++i) {
 #if defined(USE_NPU)
@@ -323,9 +331,19 @@ void MooncakeKVCacheTransferXTensor::allocate_kv_cache_xtensor(
         at_npu::native::npu_format_cast(k_tensors[i], ACL_FORMAT_ND);
     auto v_tensor =
         at_npu::native::npu_format_cast(v_tensors[i], ACL_FORMAT_ND);
-    kv_caches.emplace_back(k_tensor, v_tensor);
+    if (enable_index_tensor) {
+      auto index_tensor =
+          at_npu::native::npu_format_cast(index_tensors[i], ACL_FORMAT_ND);
+      kv_caches.emplace_back(k_tensor, v_tensor, index_tensor);
+    } else {
+      kv_caches.emplace_back(k_tensor, v_tensor);
+    }
 #else
-    kv_caches.emplace_back(k_tensors[i], v_tensors[i]);
+    if (enable_index_tensor) {
+      kv_caches.emplace_back(k_tensors[i], v_tensors[i], index_tensors[i]);
+    } else {
+      kv_caches.emplace_back(k_tensors[i], v_tensors[i]);
+    }
 #endif
   }
 
@@ -392,52 +410,70 @@ bool MooncakeKVCacheTransferXTensor::pull_kv_blocks_xtensor_mode(
     return false;
   }
 
-  auto& allocator = XTensorAllocator::get_instance();
+  std::vector<XTensorLayerOffsets> src_layer_offsets;
+  std::vector<XTensorLayerOffsets> dst_layer_offsets;
+  XTensorBlockBytes src_block_bytes;
+  XTensorBlockBytes dst_block_bytes;
+  if (!get_local_xtensor_offsets(
+          src_blocks, src_layer_offsets, &src_block_bytes) ||
+      !get_local_xtensor_offsets(
+          dst_blocks, dst_layer_offsets, &dst_block_bytes)) {
+    return false;
+  }
 
-  // For each layer, convert block_ids to GlobalXTensor offsets and transfer
-  for (int64_t layer_id = 0; layer_id < num_layers_; ++layer_id) {
-    std::vector<uint64_t> src_offsets;
-    std::vector<uint64_t> dst_offsets;
-    src_offsets.reserve(src_blocks.size() * 2);  // K and V
-    dst_offsets.reserve(dst_blocks.size() * 2);
+  if (src_block_bytes.k_block_bytes != dst_block_bytes.k_block_bytes ||
+      src_block_bytes.v_block_bytes != dst_block_bytes.v_block_bytes ||
+      src_block_bytes.index_block_bytes != dst_block_bytes.index_block_bytes) {
+    LOG(ERROR) << "Inconsistent xtensor block bytes for pull: src=("
+               << src_block_bytes.k_block_bytes << ","
+               << src_block_bytes.v_block_bytes << ","
+               << src_block_bytes.index_block_bytes << "), dst=("
+               << dst_block_bytes.k_block_bytes << ","
+               << dst_block_bytes.v_block_bytes << ","
+               << dst_block_bytes.index_block_bytes << ")";
+    return false;
+  }
 
-    for (size_t i = 0; i < src_blocks.size(); ++i) {
-      // Source block -> GlobalXTensor offsets
-      auto [src_k_off, src_v_off] = allocator.get_global_offsets_for_block(
-          model_id_, layer_id, src_blocks[i], size_per_block_);
-      if (src_k_off == UINT64_MAX || src_v_off == UINT64_MAX) {
-        LOG(ERROR) << "Failed to get source offsets for block " << src_blocks[i]
-                   << " at layer " << layer_id;
-        return false;
-      }
+  if (src_layer_offsets.size() != dst_layer_offsets.size()) {
+    LOG(ERROR) << "XTensor pull layer count mismatch: src="
+               << src_layer_offsets.size()
+               << ", dst=" << dst_layer_offsets.size();
+    return false;
+  }
 
-      // Destination block -> GlobalXTensor offsets
-      auto [dst_k_off, dst_v_off] = allocator.get_global_offsets_for_block(
-          model_id_, layer_id, dst_blocks[i], size_per_block_);
-      if (dst_k_off == UINT64_MAX || dst_v_off == UINT64_MAX) {
-        LOG(ERROR) << "Failed to get dest offsets for block " << dst_blocks[i]
-                   << " at layer " << layer_id;
-        return false;
-      }
-
-      // K cache offsets
-      src_offsets.push_back(src_k_off);
-      dst_offsets.push_back(dst_k_off);
-      // V cache offsets
-      src_offsets.push_back(src_v_off);
-      dst_offsets.push_back(dst_v_off);
+  auto* te = static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
+  for (size_t layer_id = 0; layer_id < src_layer_offsets.size(); ++layer_id) {
+    if (!move_xtensor_tensor_offsets(te,
+                                     src_addr,
+                                     src_layer_offsets[layer_id].k_offsets,
+                                     dst_layer_offsets[layer_id].k_offsets,
+                                     src_block_bytes.k_block_bytes,
+                                     MooncakeTransferEngine::MoveOpcode::READ,
+                                     "K",
+                                     static_cast<int64_t>(layer_id)) ||
+        !move_xtensor_tensor_offsets(te,
+                                     src_addr,
+                                     src_layer_offsets[layer_id].v_offsets,
+                                     dst_layer_offsets[layer_id].v_offsets,
+                                     src_block_bytes.v_block_bytes,
+                                     MooncakeTransferEngine::MoveOpcode::READ,
+                                     "V",
+                                     static_cast<int64_t>(layer_id))) {
+      return false;
     }
 
-    auto* te = static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
-    auto ret = te->move_memory_by_global_offsets(
-        src_addr,
-        src_offsets,
-        dst_offsets,
-        size_per_block_,
-        MooncakeTransferEngine::MoveOpcode::READ);
-    if (!ret) {
-      LOG(ERROR) << "pull_kv_blocks_xtensor_mode failed at layer " << layer_id;
-      return false;
+    if (src_block_bytes.has_index()) {
+      if (!move_xtensor_tensor_offsets(
+              te,
+              src_addr,
+              src_layer_offsets[layer_id].index_offsets,
+              dst_layer_offsets[layer_id].index_offsets,
+              src_block_bytes.index_block_bytes,
+              MooncakeTransferEngine::MoveOpcode::READ,
+              "index",
+              static_cast<int64_t>(layer_id))) {
+        return false;
+      }
     }
   }
 
@@ -454,7 +490,17 @@ bool MooncakeKVCacheTransferXTensor::push_kv_blocks_xtensor_mode(
     return false;
   }
 
-  auto& allocator = XTensorAllocator::get_instance();
+  std::unordered_map<std::string, XTensorOffsetsResponse> src_xtensor_infos;
+  src_xtensor_infos.reserve(merged_kv_infos.size());
+  for (const auto& pair : merged_kv_infos) {
+    XTensorOffsetsResponse response;
+    if (!get_local_xtensor_offsets(pair.second.src_blocks,
+                                   response.layer_offsets,
+                                   &response.block_bytes)) {
+      return false;
+    }
+    src_xtensor_infos.emplace(pair.first, std::move(response));
+  }
 
   for (int64_t layer_index = 0; layer_index < num_layers_; ++layer_index) {
     // Wait for the KV cache computation of this layer to complete.
@@ -463,71 +509,152 @@ bool MooncakeKVCacheTransferXTensor::push_kv_blocks_xtensor_mode(
     // Push the KV Cache computed at this layer for all requests
     for (const auto& pair : merged_kv_infos) {
       const KVCacheInfo& kv_info = pair.second;
-
-      // Check if we have XTensor offsets from D-node
-      bool has_dst_offsets = !kv_info.dst_xtensor_layer_offsets.empty() &&
-                             static_cast<size_t>(layer_index) <
-                                 kv_info.dst_xtensor_layer_offsets.size();
-
-      std::vector<uint64_t> src_offsets;
-      std::vector<uint64_t> dst_offsets;
-      src_offsets.reserve(kv_info.src_blocks.size() * 2);
-      dst_offsets.reserve(kv_info.dst_blocks.size() * 2);
-
-      for (size_t i = 0; i < kv_info.src_blocks.size(); ++i) {
-        // Source block -> GlobalXTensor offsets (calculate locally on P-node)
-        auto [src_k_off, src_v_off] = allocator.get_global_offsets_for_block(
-            model_id_, layer_index, kv_info.src_blocks[i], size_per_block_);
-        if (src_k_off == UINT64_MAX || src_v_off == UINT64_MAX) {
-          LOG(ERROR) << "Failed to get source offsets for block "
-                     << kv_info.src_blocks[i] << " at layer " << layer_index;
-          return false;
-        }
-
-        // Destination offsets: use offsets from D-node if available
-        uint64_t dst_k_off, dst_v_off;
-        if (has_dst_offsets) {
-          const auto& layer_offsets =
-              kv_info.dst_xtensor_layer_offsets[layer_index];
-          if (i < layer_offsets.k_offsets.size() &&
-              i < layer_offsets.v_offsets.size()) {
-            dst_k_off = layer_offsets.k_offsets[i];
-            dst_v_off = layer_offsets.v_offsets[i];
-          } else {
-            LOG(ERROR) << "XTensor offset index out of range for block " << i
-                       << " at layer " << layer_index;
-            return false;
-          }
-        } else {
-          LOG(ERROR) << "No XTensor destination offsets from D-node for layer "
-                     << layer_index;
-          return false;
-        }
-
-        // K cache offsets
-        src_offsets.push_back(src_k_off);
-        dst_offsets.push_back(dst_k_off);
-        // V cache offsets
-        src_offsets.push_back(src_v_off);
-        dst_offsets.push_back(dst_v_off);
-      }
-      auto* xtensor_te =
-          static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
-      auto ret = xtensor_te->move_memory_by_global_offsets(
-          kv_info.dst_addr,
-          src_offsets,
-          dst_offsets,
-          size_per_block_,
-          MooncakeTransferEngine::MoveOpcode::WRITE);
-      if (!ret) {
-        LOG(ERROR) << "push_kv_blocks_xtensor_mode failed at layer "
+      if (kv_info.dst_xtensor_layer_offsets.empty() ||
+          static_cast<size_t>(layer_index) >=
+              kv_info.dst_xtensor_layer_offsets.size()) {
+        LOG(ERROR) << "No XTensor destination offsets from D-node for layer "
                    << layer_index;
         return false;
+      }
+
+      auto src_it = src_xtensor_infos.find(pair.first);
+      if (src_it == src_xtensor_infos.end()) {
+        LOG(ERROR) << "Missing cached xtensor source offsets for "
+                   << pair.first;
+        return false;
+      }
+      const auto& src_xtensor_info = src_it->second;
+      if (static_cast<size_t>(layer_index) >=
+          src_xtensor_info.layer_offsets.size()) {
+        LOG(ERROR) << "Local XTensor source offsets missing for layer "
+                   << layer_index;
+        return false;
+      }
+
+      const XTensorBlockBytes& src_block_bytes = src_xtensor_info.block_bytes;
+      XTensorBlockBytes dst_block_bytes = kv_info.dst_xtensor_block_bytes;
+      if (!dst_block_bytes.valid()) {
+        dst_block_bytes = src_block_bytes;
+      }
+      if (src_block_bytes.k_block_bytes != dst_block_bytes.k_block_bytes ||
+          src_block_bytes.v_block_bytes != dst_block_bytes.v_block_bytes ||
+          src_block_bytes.index_block_bytes !=
+              dst_block_bytes.index_block_bytes) {
+        LOG(ERROR) << "Inconsistent xtensor block bytes for push: src=("
+                   << src_block_bytes.k_block_bytes << ","
+                   << src_block_bytes.v_block_bytes << ","
+                   << src_block_bytes.index_block_bytes << "), dst=("
+                   << dst_block_bytes.k_block_bytes << ","
+                   << dst_block_bytes.v_block_bytes << ","
+                   << dst_block_bytes.index_block_bytes << ")";
+        return false;
+      }
+
+      const auto& src_offsets = src_xtensor_info.layer_offsets[layer_index];
+      const auto& dst_offsets = kv_info.dst_xtensor_layer_offsets[layer_index];
+      auto* xtensor_te =
+          static_cast<MooncakeTransferEngine*>(mooncake_te_.get());
+      if (!move_xtensor_tensor_offsets(
+              xtensor_te,
+              kv_info.dst_addr,
+              src_offsets.k_offsets,
+              dst_offsets.k_offsets,
+              src_block_bytes.k_block_bytes,
+              MooncakeTransferEngine::MoveOpcode::WRITE,
+              "K",
+              layer_index) ||
+          !move_xtensor_tensor_offsets(
+              xtensor_te,
+              kv_info.dst_addr,
+              src_offsets.v_offsets,
+              dst_offsets.v_offsets,
+              src_block_bytes.v_block_bytes,
+              MooncakeTransferEngine::MoveOpcode::WRITE,
+              "V",
+              layer_index)) {
+        return false;
+      }
+
+      if (src_block_bytes.has_index()) {
+        if (!move_xtensor_tensor_offsets(
+                xtensor_te,
+                kv_info.dst_addr,
+                src_offsets.index_offsets,
+                dst_offsets.index_offsets,
+                src_block_bytes.index_block_bytes,
+                MooncakeTransferEngine::MoveOpcode::WRITE,
+                "index",
+                layer_index)) {
+          return false;
+        }
       }
     }
   }
 
   VLOG(1) << "push_kv_blocks_xtensor_mode success, num_layers=" << num_layers_;
+  return true;
+}
+
+bool MooncakeKVCacheTransferXTensor::get_local_xtensor_offsets(
+    const std::vector<uint64_t>& block_ids,
+    std::vector<XTensorLayerOffsets>& layer_offsets,
+    XTensorBlockBytes* block_bytes) const {
+  std::vector<int32_t> block_ids_i32;
+  block_ids_i32.reserve(block_ids.size());
+  for (uint64_t block_id : block_ids) {
+    if (block_id > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+      LOG(ERROR) << "Block id exceeds int32 range in xtensor transfer: "
+                 << block_id;
+      return false;
+    }
+    block_ids_i32.push_back(static_cast<int32_t>(block_id));
+  }
+
+  auto& allocator = XTensorAllocator::get_instance();
+  if (!allocator.get_xtensor_offsets(
+          /*dp_rank=*/0,
+          model_id_,
+          block_ids_i32,
+          /*block_size_bytes=*/0,
+          layer_offsets,
+          block_bytes)) {
+    LOG(ERROR) << "Failed to get local xtensor offsets for model " << model_id_
+               << ", num_blocks=" << block_ids.size();
+    return false;
+  }
+  return true;
+}
+
+bool MooncakeKVCacheTransferXTensor::move_xtensor_tensor_offsets(
+    MooncakeTransferEngine* transfer_engine,
+    const std::string& remote_addr,
+    const std::vector<uint64_t>& src_offsets,
+    const std::vector<uint64_t>& dst_offsets,
+    uint64_t transfer_size,
+    MooncakeTransferEngine::MoveOpcode move_opcode,
+    const char* tensor_name,
+    int64_t layer_id) const {
+  if (src_offsets.empty() && dst_offsets.empty()) {
+    return true;
+  }
+  if (src_offsets.size() != dst_offsets.size()) {
+    LOG(ERROR) << "XTensor " << tensor_name
+               << " offsets size mismatch at layer " << layer_id
+               << ": src=" << src_offsets.size()
+               << ", dst=" << dst_offsets.size();
+    return false;
+  }
+  if (transfer_size == 0) {
+    LOG(ERROR) << "XTensor " << tensor_name
+               << " transfer_size is zero at layer " << layer_id;
+    return false;
+  }
+  if (!transfer_engine->move_memory_by_global_offsets(
+          remote_addr, src_offsets, dst_offsets, transfer_size, move_opcode)) {
+    LOG(ERROR) << "XTensor " << tensor_name
+               << " move_memory_by_global_offsets failed at layer " << layer_id;
+    return false;
+  }
   return true;
 }
 

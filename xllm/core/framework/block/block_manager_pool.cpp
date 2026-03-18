@@ -21,6 +21,7 @@ limitations under the License.
 #include "framework/xtensor/page_allocator.h"
 #include "framework/xtensor/phy_page_pool.h"
 #include "framework/xtensor/xtensor_block_manager_impl.h"
+#include "framework/xtensor/xtensor_kv_layout.h"
 
 namespace xllm {
 
@@ -46,14 +47,19 @@ BlockManagerPool::BlockManagerPool(const Options& options, int32_t dp_size)
       CHECK_GT(options_.slot_size(), 0)
           << "slot_size must be set when enable_xtensor is true";
       size_t page_size = FLAGS_phy_page_granularity_size;
-      // In the current implementation, K and V must be the same size, so we
-      // divide by 2.
-      size_t block_mem_size =
-          static_cast<size_t>(options_.block_size()) * options_.slot_size() / 2;
+      XTensorKvPageLayout layout = options_.xtensor_kv_layout();
+      if (!layout.valid()) {
+        const uint64_t legacy_tensor_block_bytes =
+            static_cast<uint64_t>(options_.block_size()) *
+            options_.slot_size() / 2;
+        layout = build_xtensor_kv_layout(
+            page_size, legacy_tensor_block_bytes, legacy_tensor_block_bytes);
+      }
+      CHECK(layout.valid()) << "Invalid xtensor KV layout";
       block_managers_.emplace_back(
           std::make_unique<XTensorBlockManagerImpl>(block_options,
                                                     options_.num_layers(),
-                                                    block_mem_size,
+                                                    layout.blocks_per_virt_page,
                                                     page_size,
                                                     /*dp_rank=*/i,
                                                     options_.model_id()));

@@ -60,6 +60,67 @@ int64_t get_kv_cache_dtype_size_in_bytes(const std::string& kv_cache_dtype,
   }
   return model_dtype_size;
 }
+
+struct XTensorTensorSlotSizes {
+  int64_t k_slot_size = 0;
+  int64_t v_slot_size = 0;
+  int64_t index_slot_size = 0;
+};
+
+constexpr int32_t kNzAlignment = 16;
+
+XTensorTensorSlotSizes get_xtensor_tensor_slot_sizes(
+    const xllm::ModelArgs& args,
+    int64_t n_local_kv_heads,
+    int64_t head_dim,
+    int64_t cache_dtype_size,
+    int64_t dtype_size) {
+  XTensorTensorSlotSizes slot_sizes;
+  if (FLAGS_enable_mla) {
+#if defined(USE_NPU)
+    if (args.model_type() == "deepseek_v3" && FLAGS_enable_prefix_cache) {
+      slot_sizes.k_slot_size =
+          cache_dtype_size *
+          ((args.kv_lora_rank() + kNzAlignment - 1) / kNzAlignment) *
+          kNzAlignment;
+      slot_sizes.v_slot_size =
+          cache_dtype_size *
+          ((args.qk_rope_head_dim() + kNzAlignment - 1) / kNzAlignment) *
+          kNzAlignment;
+    } else {
+      slot_sizes.k_slot_size = cache_dtype_size * args.kv_lora_rank();
+      slot_sizes.v_slot_size = cache_dtype_size * args.qk_rope_head_dim();
+    }
+#else
+    slot_sizes.k_slot_size = cache_dtype_size * args.kv_lora_rank();
+    slot_sizes.v_slot_size = cache_dtype_size * args.qk_rope_head_dim();
+#endif
+  } else {
+    slot_sizes.k_slot_size = cache_dtype_size * head_dim * n_local_kv_heads;
+    slot_sizes.v_slot_size = slot_sizes.k_slot_size;
+  }
+
+  if (args.index_n_heads() > 0) {
+    slot_sizes.index_slot_size = dtype_size * args.index_head_dim();
+  }
+  return slot_sizes;
+}
+
+xllm::XTensorKvPageLayout build_engine_xtensor_kv_layout(
+    const xllm::ModelArgs& args,
+    int32_t block_size,
+    int64_t n_local_kv_heads,
+    int64_t head_dim,
+    int64_t cache_dtype_size,
+    int64_t dtype_size) {
+  const auto slot_sizes = get_xtensor_tensor_slot_sizes(
+      args, n_local_kv_heads, head_dim, cache_dtype_size, dtype_size);
+  return xllm::build_xtensor_kv_layout(
+      FLAGS_phy_page_granularity_size,
+      static_cast<uint64_t>(block_size) * slot_sizes.k_slot_size,
+      static_cast<uint64_t>(block_size) * slot_sizes.v_slot_size,
+      static_cast<uint64_t>(block_size) * slot_sizes.index_slot_size);
+}
 }  // namespace
 
 namespace xllm {
@@ -67,7 +128,7 @@ namespace xllm {
 // Defines a npu memory alignment constant with 16-byte alignment
 constexpr int32_t NZ_ALIGNMENT = 16;
 // Extra weight pages reserved for mapping/alignment overhead.
-constexpr size_t kXTensorWeightPageSafetyMargin = 20;
+constexpr size_t kXTensorWeightPageSafetyMargin = 2000;
 
 LLMEngine::LLMEngine(const runtime::Options& options,
                      std::shared_ptr<DistManager> dist_manager)
@@ -245,7 +306,22 @@ bool LLMEngine::init_model(MasterStatus master_status) {
     // Register model with model_id from options
     // Each model has its own logical page_list but shares physical pages
     const std::string& model_id = options_.model_id();
-    page_allocator.register_model(model_id, args_.n_layers(), master_status);
+    const int64_t cache_dtype_size = get_kv_cache_dtype_size_in_bytes(
+        options_.kv_cache_dtype(),
+        static_cast<int64_t>(torch::scalarTypeToTypeMeta(dtype_).itemsize()));
+    const int64_t dtype_size =
+        static_cast<int64_t>(torch::scalarTypeToTypeMeta(dtype_).itemsize());
+    const auto xtensor_kv_layout =
+        build_engine_xtensor_kv_layout(args_,
+                                       options_.block_size(),
+                                       n_local_kv_heads_,
+                                       head_dim_,
+                                       cache_dtype_size,
+                                       dtype_size);
+    CHECK(xtensor_kv_layout.valid())
+        << "Failed to build xtensor KV layout for model " << model_id;
+    page_allocator.register_model(
+        model_id, args_.n_layers(), master_status, xtensor_kv_layout);
 
     // Set model-specific parallel strategy for broadcast operations
     // This is important for fork master with different dp/tp than original
@@ -442,31 +518,10 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   int64_t scale_slot_size =
       0;  // Extra overhead for scale tensors in quant mode
 
-  if (FLAGS_enable_mla) {
-#if defined(USE_NPU)
-    if (args_.model_type() == "deepseek_v3" && FLAGS_enable_prefix_cache) {
-      slot_size =
-          cache_dtype_size *
-          ((args_.kv_lora_rank() + NZ_ALIGNMENT - 1) / NZ_ALIGNMENT +
-           (args_.qk_rope_head_dim() + NZ_ALIGNMENT - 1) / NZ_ALIGNMENT) *
-          NZ_ALIGNMENT;
-    } else {
-      slot_size =
-          cache_dtype_size * (args_.kv_lora_rank() + args_.qk_rope_head_dim());
-    }
-#else
-    slot_size =
-        cache_dtype_size * (args_.kv_lora_rank() + args_.qk_rope_head_dim());
-#endif
-  } else {
-    slot_size = 2 * cache_dtype_size * head_dim_ * n_local_kv_heads_;
-  }
-
-  // Indexer Cache always uses original precision (not quantized)
-  if (args_.index_n_heads() > 0) {
-    int index_n_head = 1;
-    index_slot_size = dtype_size * index_n_head * args_.index_head_dim();
-  }
+  const auto xtensor_slot_sizes = get_xtensor_tensor_slot_sizes(
+      args_, n_local_kv_heads_, head_dim_, cache_dtype_size, dtype_size);
+  slot_size = xtensor_slot_sizes.k_slot_size + xtensor_slot_sizes.v_slot_size;
+  index_slot_size = xtensor_slot_sizes.index_slot_size;
 
   // Calculate scale tensor overhead for quantized KV cache (per-token bytes).
   // worker_impl allocates scale as kv_cache_shape with last dim removed.
@@ -485,6 +540,7 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   }
   kv_cache_cap.slot_size = slot_size;
   kv_cache_cap.index_slot_size = index_slot_size;
+  kv_cache_cap.extra_slot_size = scale_slot_size;
   kv_cache_cap.n_layers = args_.n_layers();
 #if !defined(USE_NPU)
   // this adoption is because the allocation of kv cache is based on
@@ -499,12 +555,27 @@ Engine::KVCacheCapacity LLMEngine::estimate_kv_cache_capacity() {
   }
 #endif
 
-  // compute kv cache n_blocks
   const int32_t block_size = options_.block_size();
-  const int64_t block_size_in_bytes =
-      block_size * (slot_size + index_slot_size + scale_slot_size);
-  kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
-                          (kv_cache_cap.n_layers * block_size_in_bytes);
+  if (FLAGS_enable_xtensor) {
+    kv_cache_cap.xtensor_kv_layout =
+        build_engine_xtensor_kv_layout(args_,
+                                       block_size,
+                                       n_local_kv_heads_,
+                                       head_dim_,
+                                       cache_dtype_size,
+                                       dtype_size);
+    CHECK(kv_cache_cap.xtensor_kv_layout.valid())
+        << "Failed to build xtensor KV layout";
+    const uint64_t num_phy_pages =
+        kv_cache_cap.cache_size_in_bytes / FLAGS_phy_page_granularity_size;
+    kv_cache_cap.n_blocks = get_num_xtensor_blocks(
+        num_phy_pages, kv_cache_cap.n_layers, kv_cache_cap.xtensor_kv_layout);
+  } else {
+    const int64_t block_size_in_bytes =
+        block_size * (slot_size + index_slot_size + scale_slot_size);
+    kv_cache_cap.n_blocks = kv_cache_cap.cache_size_in_bytes /
+                            (kv_cache_cap.n_layers * block_size_in_bytes);
+  }
   CHECK_GT(kv_cache_cap.n_blocks, 0) << "no n_blocks for kv cache";
   return kv_cache_cap;
 }
@@ -519,7 +590,7 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
 
   CHECK_GT(kv_cache_cap.n_blocks, 0) << "no memory for kv cache";
   const int32_t block_size = options_.block_size();
-  bool enable_lighting_indexer = args_.index_n_heads() > 1;
+  bool enable_lighting_indexer = args_.index_n_heads() > 0;
 
   // init kv cache for each worker
   std::vector<std::vector<int64_t>> kv_cache_shape;
@@ -597,6 +668,7 @@ bool LLMEngine::allocate_kv_cache(const Engine::KVCacheCapacity& kv_cache_cap) {
       .enable_xtensor(FLAGS_enable_xtensor)
       .num_layers(args_.n_layers())
       .slot_size(kv_cache_cap.slot_size)
+      .xtensor_kv_layout(kv_cache_cap.xtensor_kv_layout)
       .model_id(options_.model_id());
 
   if (options_.host_blocks_factor() > 1.0 || options_.enable_kvcache_store()) {
@@ -1286,32 +1358,35 @@ bool LLMEngine::wakeup(const WakeupOptions& options) {
 bool LLMEngine::get_xtensor_offsets_for_blocks(
     int32_t dp_rank,
     const std::vector<int32_t>& block_ids,
-    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
-        layer_offsets) {
+    std::vector<XTensorLayerOffsets>& layer_offsets,
+    XTensorBlockBytes* block_bytes) {
   if (!FLAGS_enable_xtensor) {
     return false;
   }
 
   const std::string& model_id = options_.model_id();
 
-  // Calculate block size in bytes: block_size * slot_size
-  // slot_size is stored in kv_cache_manager (BlockManagerPool)
+  // Legacy RPC parameter: workers now use their local per-tensor layout to
+  // resolve offsets, but the request still carries a block_size field for
+  // backward compatibility.
   auto* block_manager = block_manager_pool();
   if (!block_manager) {
     LOG(ERROR) << "BlockManagerPool not available";
     return false;
   }
 
-  // Note: Currently, xtensor only supports the traditional attention mechanism,
-  // meaning both K and V must be present and have identical shapes.
   uint64_t block_size_bytes =
       static_cast<uint64_t>(block_manager->options().slot_size()) *
       options_.block_size() / 2;
 
   // Use RPC to call worker in the specified DP group
   auto& allocator = XTensorAllocator::get_instance();
-  bool success = allocator.get_xtensor_offsets(
-      dp_rank, model_id, block_ids, block_size_bytes, layer_offsets);
+  bool success = allocator.get_xtensor_offsets(dp_rank,
+                                               model_id,
+                                               block_ids,
+                                               block_size_bytes,
+                                               layer_offsets,
+                                               block_bytes);
 
   if (!success) {
     LOG(ERROR) << "get_xtensor_offsets_for_blocks via RPC failed for dp_rank="

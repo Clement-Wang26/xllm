@@ -31,6 +31,7 @@ limitations under the License.
 #include "xtensor.h"
 #include "xtensor_dist_client.h"
 #include "xtensor_dist_server.h"
+#include "xtensor_kv_layout.h"
 
 namespace xllm {
 
@@ -42,8 +43,14 @@ struct ModelTensors {
   std::vector<std::unique_ptr<XTensor>> k_tensors;
   // V tensors: one tensor per layer (indexed by layer id)
   std::vector<std::unique_ptr<XTensor>> v_tensors;
+  // Optional MLA index tensors: one tensor per layer when enabled.
+  std::vector<std::unique_ptr<XTensor>> index_tensors;
   int64_t num_layers = 0;
   size_t kv_tensor_size_per_layer = 0;
+  XTensorKvPageLayout kv_layout;
+  size_t k_block_bytes = 0;
+  size_t v_block_bytes = 0;
+  size_t index_block_bytes = 0;
 
   // ============== Weight Allocation (from GlobalXTensor) ==============
   page_id_t weight_start_page_id =
@@ -105,6 +112,13 @@ class XTensorAllocator {
                                               const std::vector<int64_t>& dims,
                                               torch::Dtype dtype,
                                               int64_t num_layers);
+
+  // Create optional MLA index tensors for all layers of a model
+  std::vector<torch::Tensor> create_index_tensors(
+      const std::string& model_id,
+      const std::vector<int64_t>& dims,
+      torch::Dtype dtype,
+      int64_t num_layers);
 
   // KV tensor operations (partial mapping by offsets)
   bool map_to_kv_tensors(const std::string& model_id,
@@ -190,15 +204,16 @@ class XTensorAllocator {
   //   model_id: Model identifier
   //   block_ids: Block IDs to get offsets for
   //   block_size_bytes: Size of each block in bytes
-  //   layer_offsets: Output, layer_offsets[layer_id] = {k_offsets, v_offsets}
+  //   layer_offsets: Output, per-layer K/V offsets with optional index
+  //                  offsets.
+  //   block_bytes: Output, per-tensor block bytes for K/V/index(optional).
   // Returns: true on success
-  bool get_xtensor_offsets(
-      int32_t dp_rank,
-      const std::string& model_id,
-      const std::vector<int32_t>& block_ids,
-      uint64_t block_size_bytes,
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
-          layer_offsets);
+  bool get_xtensor_offsets(int32_t dp_rank,
+                           const std::string& model_id,
+                           const std::vector<int32_t>& block_ids,
+                           uint64_t block_size_bytes,
+                           std::vector<XTensorLayerOffsets>& layer_offsets,
+                           XTensorBlockBytes* block_bytes = nullptr);
 
   // ============== PD Disaggregation Support (XTensor Mode) ==============
 
@@ -258,6 +273,31 @@ class XTensorAllocator {
       torch::Dtype dtype,
       int64_t num_layers,
       std::vector<std::unique_ptr<XTensor>>& tensors_out);
+
+  size_t infer_block_bytes_(const std::vector<int64_t>& dims,
+                            torch::Dtype dtype) const;
+  void update_kv_layout_(ModelTensors& model,
+                         size_t page_size,
+                         size_t k_block_bytes,
+                         size_t v_block_bytes,
+                         size_t index_block_bytes);
+  bool map_logical_offsets_to_tensor_(
+      XTensor* xtensor,
+      const std::vector<offset_t>& logical_offsets,
+      uint64_t tensor_block_bytes,
+      uint32_t tensor_pages_per_virt_page,
+      std::vector<offset_t>& newly_mapped_offsets);
+  bool unmap_logical_offsets_from_tensor_(
+      XTensor* xtensor,
+      const std::vector<offset_t>& logical_offsets,
+      uint64_t tensor_block_bytes,
+      uint32_t tensor_pages_per_virt_page);
+  uint64_t get_global_offset_for_tensor_block_(
+      const XTensor* xtensor,
+      const XTensorKvPageLayout& layout,
+      uint64_t tensor_block_bytes,
+      uint32_t tensor_pages_per_virt_page,
+      int64_t block_id) const;
 
   // Device initialization (platform-agnostic)
   void init_device_();

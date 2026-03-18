@@ -207,14 +207,12 @@ folly::SemiFuture<bool> XTensorDistClient::free_weight_pages_async(
   return future;
 }
 
-folly::SemiFuture<
-    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>>
+folly::SemiFuture<XTensorOffsetsResponse>
 XTensorDistClient::get_xtensor_offsets_async(
     const std::string& model_id,
     const std::vector<int32_t>& block_ids,
     uint64_t block_size_bytes) {
-  using ResultType =
-      std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>;
+  using ResultType = XTensorOffsetsResponse;
   folly::Promise<ResultType> promise;
   auto future = promise.getSemiFuture();
 
@@ -240,20 +238,29 @@ XTensorDistClient::get_xtensor_offsets_async(
       return;
     }
 
-    // Convert proto response to vector of pairs
-    ResultType layer_offsets;
-    layer_offsets.reserve(resp.layer_offsets_size());
+    // Convert proto response to per-layer offsets.
+    ResultType result;
+    result.layer_offsets.reserve(resp.layer_offsets_size());
 
     for (int i = 0; i < resp.layer_offsets_size(); ++i) {
       const auto& layer_proto = resp.layer_offsets(i);
-      std::vector<uint64_t> k_offsets(layer_proto.k_offsets().begin(),
-                                      layer_proto.k_offsets().end());
-      std::vector<uint64_t> v_offsets(layer_proto.v_offsets().begin(),
-                                      layer_proto.v_offsets().end());
-      layer_offsets.emplace_back(std::move(k_offsets), std::move(v_offsets));
+      XTensorLayerOffsets layer_offsets_proto;
+      layer_offsets_proto.k_offsets.assign(layer_proto.k_offsets().begin(),
+                                           layer_proto.k_offsets().end());
+      layer_offsets_proto.v_offsets.assign(layer_proto.v_offsets().begin(),
+                                           layer_proto.v_offsets().end());
+      layer_offsets_proto.index_offsets.assign(
+          layer_proto.index_offsets().begin(),
+          layer_proto.index_offsets().end());
+      result.layer_offsets.emplace_back(std::move(layer_offsets_proto));
     }
 
-    promise.setValue(std::move(layer_offsets));
+    result.block_bytes.k_block_bytes = resp.block_bytes().k_block_bytes();
+    result.block_bytes.v_block_bytes = resp.block_bytes().v_block_bytes();
+    result.block_bytes.index_block_bytes =
+        resp.block_bytes().index_block_bytes();
+
+    promise.setValue(std::move(result));
   });
 
   return future;

@@ -49,7 +49,7 @@ class XTensorBlockManagerImpl : public BlockManager {
  public:
   explicit XTensorBlockManagerImpl(const Options& options,
                                    int64_t num_layers,
-                                   size_t block_mem_size,
+                                   size_t blocks_per_virt_page,
                                    size_t page_size,
                                    int32_t dp_rank = 0,
                                    const std::string& model_id = "");
@@ -143,8 +143,8 @@ class XTensorBlockManagerImpl : public BlockManager {
   // Page size
   size_t page_size_;
 
-  // Block memory size in bytes
-  size_t block_mem_size_;
+  // Number of logical blocks stored in one virt_page.
+  size_t blocks_per_virt_page_;
 
   // Number of available blocks in avail_pages
   std::atomic<size_t> num_avail_blocks_;

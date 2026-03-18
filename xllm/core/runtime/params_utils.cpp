@@ -339,9 +339,18 @@ void proto_to_forward_input(const proto::ForwardInput* pb_forward_input,
       layer_offsets.v_offsets =
           std::vector<uint64_t>(pb_layer_offsets.v_offsets().begin(),
                                 pb_layer_offsets.v_offsets().end());
+      layer_offsets.index_offsets =
+          std::vector<uint64_t>(pb_layer_offsets.index_offsets().begin(),
+                                pb_layer_offsets.index_offsets().end());
       transfer_kv_info.dst_xtensor_layer_offsets.emplace_back(
           std::move(layer_offsets));
     }
+    transfer_kv_info.dst_xtensor_block_bytes.k_block_bytes =
+        pb_info.dst_xtensor_block_bytes().k_block_bytes();
+    transfer_kv_info.dst_xtensor_block_bytes.v_block_bytes =
+        pb_info.dst_xtensor_block_bytes().v_block_bytes();
+    transfer_kv_info.dst_xtensor_block_bytes.index_block_bytes =
+        pb_info.dst_xtensor_block_bytes().index_block_bytes();
 
     forward_inputs.transfer_kv_infos.emplace_back(std::move(transfer_kv_info));
   }
@@ -482,7 +491,16 @@ void forward_input_to_proto(const RawForwardInput& inputs,
                             layer_offsets.k_offsets);
         ADD_VECTOR_TO_PROTO(pb_layer_offsets->mutable_v_offsets(),
                             layer_offsets.v_offsets);
+        ADD_VECTOR_TO_PROTO(pb_layer_offsets->mutable_index_offsets(),
+                            layer_offsets.index_offsets);
       }
+      pb_transfer_kv_info->mutable_dst_xtensor_block_bytes()->set_k_block_bytes(
+          transfer_kv_info.dst_xtensor_block_bytes.k_block_bytes);
+      pb_transfer_kv_info->mutable_dst_xtensor_block_bytes()->set_v_block_bytes(
+          transfer_kv_info.dst_xtensor_block_bytes.v_block_bytes);
+      pb_transfer_kv_info->mutable_dst_xtensor_block_bytes()
+          ->set_index_block_bytes(
+              transfer_kv_info.dst_xtensor_block_bytes.index_block_bytes);
     }
   }
   pb_forward_input->mutable_eplb_info()->set_prepare_layer_id(

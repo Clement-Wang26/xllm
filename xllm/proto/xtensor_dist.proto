@@ -45,16 +45,25 @@ message GetXTensorOffsetsRequest {
   uint64 block_size_bytes = 3;
 }
 
-// Per-layer K/V offsets for XTensor
+message XTensorBlockBytesProto {
+  uint64 k_block_bytes = 1;
+  uint64 v_block_bytes = 2;
+  uint64 index_block_bytes = 3;
+}
+
+// Per-layer K/V offsets for XTensor, with optional MLA index offsets.
 message XTensorLayerOffsetsProto {
   repeated uint64 k_offsets = 1;
   repeated uint64 v_offsets = 2;
+  repeated uint64 index_offsets = 3;
 }
 
 // Response for XTensor offsets
 message GetXTensorOffsetsResponse {
-  // Per-layer offsets: layer_offsets[layer_id] contains K/V offsets for all blocks
+  // Per-layer offsets: layer_offsets[layer_id] contains K/V offsets and
+  // optional index offsets for all blocks.
   repeated XTensorLayerOffsetsProto layer_offsets = 1;
+  XTensorBlockBytesProto block_bytes = 2;
 }
 
 // XTensorDist service for distributed XTensor mapping operations

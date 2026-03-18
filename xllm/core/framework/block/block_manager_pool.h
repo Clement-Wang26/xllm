@@ -20,6 +20,7 @@ limitations under the License.
 
 #include "block_manager.h"
 #include "framework/block/kv_cache_manager.h"
+#include "framework/xtensor/xtensor_kv_layout.h"
 
 namespace xllm {
 
@@ -36,7 +37,8 @@ class BlockManagerPool : public KVCacheManager {
     PROPERTY(bool, enable_xtensor) = false;
     PROPERTY(int64_t, num_layers) = 0;  // Required when enable_xtensor is true
     PROPERTY(int64_t, slot_size) = 0;   // Memory size per slot (for xtensor)
-    PROPERTY(std::string, model_id);    // Model ID for multi-model support
+    PROPERTY(XTensorKvPageLayout, xtensor_kv_layout);
+    PROPERTY(std::string, model_id);  // Model ID for multi-model support
   };
 
   explicit BlockManagerPool(const Options& options, int32_t dp_size = 1);

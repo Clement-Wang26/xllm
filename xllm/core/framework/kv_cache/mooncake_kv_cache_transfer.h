@@ -155,6 +155,21 @@ class MooncakeKVCacheTransferXTensor final
       std::unordered_map<std::string, KVCacheInfo>& merged_kv_infos,
       std::shared_ptr<NPULayerSynchronizerImpl>& layer_synchronizer);
 
+  bool get_local_xtensor_offsets(
+      const std::vector<uint64_t>& block_ids,
+      std::vector<XTensorLayerOffsets>& layer_offsets,
+      XTensorBlockBytes* block_bytes = nullptr) const;
+
+  bool move_xtensor_tensor_offsets(
+      MooncakeTransferEngine* transfer_engine,
+      const std::string& remote_addr,
+      const std::vector<uint64_t>& src_offsets,
+      const std::vector<uint64_t>& dst_offsets,
+      uint64_t transfer_size,
+      MooncakeTransferEngine::MoveOpcode move_opcode,
+      const char* tensor_name,
+      int64_t layer_id) const;
+
   std::string model_id_;
 };
 

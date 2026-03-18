@@ -38,8 +38,9 @@ class KVCacheTransfer {
     std::vector<uint64_t> dst_blocks;
 
     // XTensor mode: destination offsets from D-node (per-layer)
-    // dst_xtensor_layer_offsets[layer_id] = {k_offsets, v_offsets}
+    // `index_offsets` is optional for MLA and may be empty.
     std::vector<XTensorLayerOffsets> dst_xtensor_layer_offsets;
+    XTensorBlockBytes dst_xtensor_block_bytes;
   };
 
   KVCacheTransfer() = default;

@@ -277,8 +277,28 @@ struct InstanceInfo {
 
 // XTensor mode: per-layer offsets for KV cache transfer
 struct XTensorLayerOffsets {
-  std::vector<uint64_t> k_offsets;  // K cache offsets in GlobalXTensor
-  std::vector<uint64_t> v_offsets;  // V cache offsets in GlobalXTensor
+  std::vector<uint64_t> k_offsets;      // K cache offsets in GlobalXTensor
+  std::vector<uint64_t> v_offsets;      // V cache offsets in GlobalXTensor
+  std::vector<uint64_t> index_offsets;  // Optional MLA index offsets
+};
+
+struct XTensorBlockBytes {
+  uint64_t k_block_bytes = 0;
+  uint64_t v_block_bytes = 0;
+  uint64_t index_block_bytes = 0;
+
+  [[nodiscard]] bool valid() const noexcept {
+    return k_block_bytes > 0 && v_block_bytes > 0;
+  }
+
+  [[nodiscard]] bool has_index() const noexcept {
+    return index_block_bytes > 0;
+  }
+};
+
+struct XTensorOffsetsResponse {
+  std::vector<XTensorLayerOffsets> layer_offsets;
+  XTensorBlockBytes block_bytes;
 };
 
 struct TransferKVInfo {
@@ -291,6 +311,7 @@ struct TransferKVInfo {
   // XTensor mode: destination offsets from D-node (per-layer)
   // Only populated when FLAGS_enable_xtensor is true
   std::vector<XTensorLayerOffsets> dst_xtensor_layer_offsets;
+  XTensorBlockBytes dst_xtensor_block_bytes;
 };
 
 // in bytes

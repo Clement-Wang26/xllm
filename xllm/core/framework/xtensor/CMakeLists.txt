@@ -12,6 +12,7 @@ cc_library(
     page_allocator.h
     global_xtensor.h
     xtensor.h
+    xtensor_kv_layout.h
     xtensor_allocator.h
     xtensor_block_manager_impl.h
     xtensor_dist_client.h

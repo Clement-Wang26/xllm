@@ -28,6 +28,30 @@ limitations under the License.
 
 namespace xllm {
 
+namespace {
+
+void merge_xtensor_block_bytes(XTensorBlockBytes& dst,
+                               const XTensorBlockBytes& src) {
+  if (!src.valid()) {
+    return;
+  }
+  if (!dst.valid()) {
+    dst = src;
+    return;
+  }
+  if (dst.k_block_bytes != src.k_block_bytes ||
+      dst.v_block_bytes != src.v_block_bytes ||
+      dst.index_block_bytes != src.index_block_bytes) {
+    LOG(ERROR) << "Inconsistent xtensor block bytes while merging KV blocks: "
+               << "existing=(" << dst.k_block_bytes << "," << dst.v_block_bytes
+               << "," << dst.index_block_bytes << "), incoming=("
+               << src.k_block_bytes << "," << src.v_block_bytes << ","
+               << src.index_block_bytes << ")";
+  }
+}
+
+}  // namespace
+
 folly::SemiFuture<bool> KVCacheTransfer::pull_kv_blocks_async(
     const uint64_t src_cluster_id,
     const std::string& src_addr,
@@ -144,6 +168,8 @@ void KVCacheTransfer::merge_kv_blocks(
         if (!info.dst_xtensor_layer_offsets.empty()) {
           kv_info.dst_xtensor_layer_offsets = info.dst_xtensor_layer_offsets;
         }
+        merge_xtensor_block_bytes(kv_info.dst_xtensor_block_bytes,
+                                  info.dst_xtensor_block_bytes);
 
         merged_kv_infos[key] = std::move(kv_info);
       } else {
@@ -176,9 +202,15 @@ void KVCacheTransfer::merge_kv_blocks(
                   existing[layer].v_offsets.end(),
                   info.dst_xtensor_layer_offsets[layer].v_offsets.begin(),
                   info.dst_xtensor_layer_offsets[layer].v_offsets.end());
+              existing[layer].index_offsets.insert(
+                  existing[layer].index_offsets.end(),
+                  info.dst_xtensor_layer_offsets[layer].index_offsets.begin(),
+                  info.dst_xtensor_layer_offsets[layer].index_offsets.end());
             }
           }
         }
+        merge_xtensor_block_bytes(merged_kv_infos[key].dst_xtensor_block_bytes,
+                                  info.dst_xtensor_block_bytes);
       }
     }
   }

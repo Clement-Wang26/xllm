@@ -32,6 +32,7 @@ limitations under the License.
 #include "common/types.h"
 #include "virt_page.h"
 #include "xtensor.h"  // For offset_t type definition
+#include "xtensor_kv_layout.h"
 
 namespace xllm {
 
@@ -89,7 +90,8 @@ class PageAllocator {
   // Returns true if registration successful
   bool register_model(const std::string& model_id,
                       int64_t num_layers,
-                      MasterStatus master_status);
+                      MasterStatus master_status,
+                      const XTensorKvPageLayout& kv_layout);
 
   // Put a model to sleep:
   // - Release weight pages (via free_weight_pages)
@@ -181,10 +183,11 @@ class PageAllocator {
   // worker_pages_used_[i]
   std::vector<size_t> get_all_worker_free_pages() const;
 
-  // Convert block_id to virt_page_id
-  int64_t get_virt_page_id(int64_t block_id, size_t block_mem_size) const;
+  // Convert block_id to the logical virt_page_id selected for this model.
+  int64_t get_virt_page_id(const std::string& model_id, int64_t block_id) const;
 
-  // Get offset for XTensor map/unmap (based on single-layer)
+  // Get the logical base offset for a virt_page_id. XTensorAllocator expands
+  // this logical page into per-tensor offsets.
   offset_t get_offset(int64_t virt_page_id) const;
 
   // Get configuration
@@ -193,6 +196,9 @@ class PageAllocator {
 
   // Get number of physical pages consumed per virtual page allocation
   size_t phy_pages_per_virt_page(const std::string& model_id) const;
+
+  // Get number of logical blocks stored in one virt_page.
+  size_t blocks_per_virt_page(const std::string& model_id) const;
 
  private:
   PageAllocator() = default;
@@ -215,6 +221,8 @@ class PageAllocator {
     int64_t num_layers = 0;
     size_t num_total_virt_pages = 0;
     size_t phy_pages_per_virt_page = 0;
+    size_t blocks_per_virt_page = 0;
+    XTensorKvPageLayout kv_layout;
     size_t weight_pages_allocated = 0;  // Not cleared on free, used for wakeup
     bool is_sleeping = false;
     // Count of pending map operations (for safe sleep)

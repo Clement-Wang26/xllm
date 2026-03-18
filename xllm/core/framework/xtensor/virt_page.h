@@ -35,6 +35,9 @@ class VirtPage {
   // Initialize the page with block memory size
   void init(size_t block_mem_size);
 
+  // Initialize the page with a fixed number of logical blocks.
+  void init_fixed_blocks(size_t blocks_per_page);
+
   // Allocate blocks from this page
   std::vector<int64_t> alloc(size_t num_blocks = 1);
 

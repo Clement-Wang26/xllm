@@ -21,6 +21,7 @@ limitations under the License.
 #include <algorithm>
 #include <memory>
 
+#include "common/global_flags.h"
 #include "common/metrics.h"
 #include "llm_engine.h"
 #include "runtime/forward_params.h"
@@ -158,11 +159,14 @@ bool SpeculativeEngine::allocate_kv_cache() {
   int64_t n_blocks = 0;
   // check if llm and ssm are using same device
   if (share_device_) {
-    // on the same device, use the smaller kv cache size
-    n_blocks = calculate_kv_cache(
-        kv_cache_size,
-        target_kv_cache_cap.n_layers * target_kv_cache_cap.slot_size,
-        draft_kv_cache_cap.n_layers * draft_kv_cache_cap.slot_size);
+    // On the same device, account for the exact per-block KV footprint,
+    // including xtensor page packing and auxiliary metadata tensors.
+    n_blocks =
+        calculate_shared_kv_cache_blocks(kv_cache_size,
+                                         target_kv_cache_cap,
+                                         draft_kv_cache_cap,
+                                         options_.block_size(),
+                                         FLAGS_phy_page_granularity_size);
   } else {
     // on different devices, use the smaller number of blocks
     n_blocks =
@@ -182,17 +186,6 @@ bool SpeculativeEngine::allocate_kv_cache() {
 // TODO: support dp batches later
 ForwardOutput SpeculativeEngine::step(std::vector<Batch>& batches) {
   return engine_->step(batches);
-}
-
-int64_t SpeculativeEngine::calculate_kv_cache(int64_t cache_size_in_bytes,
-                                              int64_t target_size,
-                                              int64_t draft_size) const {
-  CHECK_GT(cache_size_in_bytes, 0) << "no memory for kv cache";
-  const int32_t block_size = options_.block_size();
-
-  // compute the number of blocks
-  const int64_t block_size_in_bytes = block_size * (target_size + draft_size);
-  return cache_size_in_bytes / block_size_in_bytes;
 }
 
 void SpeculativeEngine::update_last_step_result(std::vector<Batch>& batch) {

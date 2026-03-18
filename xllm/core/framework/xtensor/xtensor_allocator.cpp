@@ -507,6 +507,14 @@ std::vector<torch::Tensor> XTensorAllocator::create_v_tensors(
   return create_kv_tensors_impl_(model_id, dims, dtype, num_layers, "V");
 }
 
+std::vector<torch::Tensor> XTensorAllocator::create_index_tensors(
+    const std::string& model_id,
+    const std::vector<int64_t>& dims,
+    torch::Dtype dtype,
+    int64_t num_layers) {
+  return create_kv_tensors_impl_(model_id, dims, dtype, num_layers, "index");
+}
+
 std::vector<torch::Tensor> XTensorAllocator::create_kv_tensors_impl_(
     const std::string& model_id,
     const std::vector<int64_t>& dims,
@@ -524,6 +532,8 @@ std::vector<torch::Tensor> XTensorAllocator::create_kv_tensors_impl_(
     target_tensors = &model.k_tensors;
   } else if (strcmp(name, "V") == 0) {
     target_tensors = &model.v_tensors;
+  } else if (strcmp(name, "index") == 0) {
+    target_tensors = &model.index_tensors;
   } else {
     LOG(FATAL) << "Unknown tensor name: " << name;
   }
@@ -552,6 +562,19 @@ std::vector<torch::Tensor> XTensorAllocator::create_kv_tensors_impl_(
 
   model.num_layers = num_layers;
   model.kv_tensor_size_per_layer = size;
+  const size_t block_bytes = infer_block_bytes_(dims, dtype);
+  if (strcmp(name, "K") == 0) {
+    model.k_block_bytes = block_bytes;
+  } else if (strcmp(name, "V") == 0) {
+    model.v_block_bytes = block_bytes;
+  } else if (strcmp(name, "index") == 0) {
+    model.index_block_bytes = block_bytes;
+  }
+  update_kv_layout_(model,
+                    page_size,
+                    model.k_block_bytes,
+                    model.v_block_bytes,
+                    model.index_block_bytes);
 
   if (!zero_page_) {
     zero_page_ = PhyPagePool::get_instance().get_zero_page();
@@ -571,18 +594,83 @@ bool XTensorAllocator::map_to_kv_tensors(const std::string& model_id,
     return false;
   }
 
-  if (tensors->k_tensors.empty() || tensors->v_tensors.empty()) {
+  if (tensors->k_tensors.empty() || tensors->v_tensors.empty() ||
+      !tensors->kv_layout.valid()) {
     LOG(ERROR) << "KV tensors not created for model " << model_id;
     return false;
   }
 
-  // Per-layer mapping for K and V tensors separately
+  if (tensors->kv_layout.has_index() && tensors->index_tensors.empty()) {
+    LOG(ERROR) << "Index tensors expected but not created for model "
+               << model_id;
+    return false;
+  }
+
+  std::vector<std::pair<XTensor*, offset_t>> mapped_entries;
   for (int64_t i = 0; i < tensors->num_layers; i++) {
-    auto k_xtensor = tensors->k_tensors[i].get();
-    auto v_xtensor = tensors->v_tensors[i].get();
-    for (auto offset : offsets) {
-      k_xtensor->map(offset);
-      v_xtensor->map(offset);
+    std::vector<offset_t> k_new_offsets;
+    std::vector<offset_t> v_new_offsets;
+    std::vector<offset_t> index_new_offsets;
+    if (!map_logical_offsets_to_tensor_(
+            tensors->k_tensors[i].get(),
+            offsets,
+            tensors->kv_layout.k_block_bytes,
+            tensors->kv_layout.k_pages_per_virt_page,
+            k_new_offsets) ||
+        !map_logical_offsets_to_tensor_(
+            tensors->v_tensors[i].get(),
+            offsets,
+            tensors->kv_layout.v_block_bytes,
+            tensors->kv_layout.v_pages_per_virt_page,
+            v_new_offsets)) {
+      for (auto it = v_new_offsets.rbegin(); it != v_new_offsets.rend(); ++it) {
+        tensors->v_tensors[i]->unmap(*it);
+      }
+      for (auto it = k_new_offsets.rbegin(); it != k_new_offsets.rend(); ++it) {
+        tensors->k_tensors[i]->unmap(*it);
+      }
+      for (auto it = mapped_entries.rbegin(); it != mapped_entries.rend();
+           ++it) {
+        it->first->unmap(it->second);
+      }
+      LOG(ERROR) << "Failed to map logical offsets for model " << model_id
+                 << " layer=" << i;
+      return false;
+    }
+    for (offset_t offset : k_new_offsets) {
+      mapped_entries.emplace_back(tensors->k_tensors[i].get(), offset);
+    }
+    for (offset_t offset : v_new_offsets) {
+      mapped_entries.emplace_back(tensors->v_tensors[i].get(), offset);
+    }
+
+    if (!tensors->index_tensors.empty() &&
+        !map_logical_offsets_to_tensor_(
+            tensors->index_tensors[i].get(),
+            offsets,
+            tensors->kv_layout.index_block_bytes,
+            tensors->kv_layout.index_pages_per_virt_page,
+            index_new_offsets)) {
+      for (auto it = index_new_offsets.rbegin(); it != index_new_offsets.rend();
+           ++it) {
+        tensors->index_tensors[i]->unmap(*it);
+      }
+      for (auto it = v_new_offsets.rbegin(); it != v_new_offsets.rend(); ++it) {
+        tensors->v_tensors[i]->unmap(*it);
+      }
+      for (auto it = k_new_offsets.rbegin(); it != k_new_offsets.rend(); ++it) {
+        tensors->k_tensors[i]->unmap(*it);
+      }
+      for (auto it = mapped_entries.rbegin(); it != mapped_entries.rend();
+           ++it) {
+        it->first->unmap(it->second);
+      }
+      LOG(ERROR) << "Failed to map index logical offsets for model " << model_id
+                 << " layer=" << i;
+      return false;
+    }
+    for (offset_t offset : index_new_offsets) {
+      mapped_entries.emplace_back(tensors->index_tensors[i].get(), offset);
     }
   }
 
@@ -600,19 +688,30 @@ bool XTensorAllocator::unmap_from_kv_tensors(
     return false;
   }
 
-  if (tensors->k_tensors.empty() || tensors->v_tensors.empty()) {
+  if (tensors->k_tensors.empty() || tensors->v_tensors.empty() ||
+      !tensors->kv_layout.valid()) {
     LOG(ERROR) << "try to unmap from KV tensors when KV tensors are not created"
                << " for model " << model_id;
     return false;
   }
 
-  // Per-layer unmapping for K and V tensors separately
   for (int64_t i = 0; i < tensors->num_layers; i++) {
-    auto k_xtensor = tensors->k_tensors[i].get();
-    auto v_xtensor = tensors->v_tensors[i].get();
-    for (auto offset : offsets) {
-      k_xtensor->unmap(offset);
-      v_xtensor->unmap(offset);
+    unmap_logical_offsets_from_tensor_(
+        tensors->k_tensors[i].get(),
+        offsets,
+        tensors->kv_layout.k_block_bytes,
+        tensors->kv_layout.k_pages_per_virt_page);
+    unmap_logical_offsets_from_tensor_(
+        tensors->v_tensors[i].get(),
+        offsets,
+        tensors->kv_layout.v_block_bytes,
+        tensors->kv_layout.v_pages_per_virt_page);
+    if (!tensors->index_tensors.empty()) {
+      unmap_logical_offsets_from_tensor_(
+          tensors->index_tensors[i].get(),
+          offsets,
+          tensors->kv_layout.index_block_bytes,
+          tensors->kv_layout.index_pages_per_virt_page);
     }
   }
 
@@ -752,6 +851,114 @@ bool XTensorAllocator::allocate_weight(const std::string& model_id,
 
 // ============== Internal Helpers ==============
 
+size_t XTensorAllocator::infer_block_bytes_(const std::vector<int64_t>& dims,
+                                            torch::Dtype dtype) const {
+  CHECK_GE(dims.size(), 2u) << "KV tensor dims must include [n_blocks, ...]";
+  size_t block_bytes = torch::scalarTypeToTypeMeta(dtype).itemsize();
+  for (size_t i = 1; i < dims.size(); ++i) {
+    block_bytes *= static_cast<size_t>(dims[i]);
+  }
+  return block_bytes;
+}
+
+void XTensorAllocator::update_kv_layout_(ModelTensors& model,
+                                         size_t page_size,
+                                         size_t k_block_bytes,
+                                         size_t v_block_bytes,
+                                         size_t index_block_bytes) {
+  if (k_block_bytes == 0 || v_block_bytes == 0) {
+    return;
+  }
+  model.kv_layout = build_xtensor_kv_layout(
+      page_size, k_block_bytes, v_block_bytes, index_block_bytes);
+  CHECK(model.kv_layout.valid()) << "Failed to build model KV layout";
+}
+
+bool XTensorAllocator::map_logical_offsets_to_tensor_(
+    XTensor* xtensor,
+    const std::vector<offset_t>& logical_offsets,
+    uint64_t tensor_block_bytes,
+    uint32_t tensor_pages_per_virt_page,
+    std::vector<offset_t>& newly_mapped_offsets) {
+  (void)tensor_block_bytes;
+  if (xtensor == nullptr || tensor_block_bytes == 0 ||
+      tensor_pages_per_virt_page == 0) {
+    return true;
+  }
+
+  const size_t page_size = FLAGS_phy_page_granularity_size;
+  for (offset_t logical_offset : logical_offsets) {
+    const uint64_t virt_page_id = logical_offset / page_size;
+    const offset_t tensor_base_offset = static_cast<offset_t>(virt_page_id) *
+                                        tensor_pages_per_virt_page * page_size;
+    for (uint32_t page_index = 0; page_index < tensor_pages_per_virt_page;
+         ++page_index) {
+      const offset_t tensor_offset =
+          tensor_base_offset + static_cast<offset_t>(page_index) * page_size;
+      if (xtensor->is_mapped(tensor_offset)) {
+        continue;
+      }
+      if (!xtensor->map(tensor_offset)) {
+        return false;
+      }
+      newly_mapped_offsets.push_back(tensor_offset);
+    }
+  }
+  return true;
+}
+
+bool XTensorAllocator::unmap_logical_offsets_from_tensor_(
+    XTensor* xtensor,
+    const std::vector<offset_t>& logical_offsets,
+    uint64_t tensor_block_bytes,
+    uint32_t tensor_pages_per_virt_page) {
+  (void)tensor_block_bytes;
+  if (xtensor == nullptr || tensor_block_bytes == 0 ||
+      tensor_pages_per_virt_page == 0) {
+    return true;
+  }
+
+  const size_t page_size = FLAGS_phy_page_granularity_size;
+  for (offset_t logical_offset : logical_offsets) {
+    const uint64_t virt_page_id = logical_offset / page_size;
+    const offset_t tensor_base_offset = static_cast<offset_t>(virt_page_id) *
+                                        tensor_pages_per_virt_page * page_size;
+    for (uint32_t page_index = 0; page_index < tensor_pages_per_virt_page;
+         ++page_index) {
+      const offset_t tensor_offset =
+          tensor_base_offset + static_cast<offset_t>(page_index) * page_size;
+      if (!xtensor->unmap(tensor_offset)) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+uint64_t XTensorAllocator::get_global_offset_for_tensor_block_(
+    const XTensor* xtensor,
+    const XTensorKvPageLayout& layout,
+    uint64_t tensor_block_bytes,
+    uint32_t tensor_pages_per_virt_page,
+    int64_t block_id) const {
+  constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
+  if (xtensor == nullptr || !layout.valid() || tensor_block_bytes == 0 ||
+      tensor_pages_per_virt_page == 0) {
+    return INVALID_OFFSET;
+  }
+
+  const uint64_t tensor_byte_offset = get_tensor_offset_for_block(
+      block_id, tensor_block_bytes, tensor_pages_per_virt_page, layout);
+  const offset_t page_aligned_offset = static_cast<offset_t>(
+      (tensor_byte_offset / layout.page_size) * layout.page_size);
+  const uint64_t offset_within_page = tensor_byte_offset % layout.page_size;
+  const page_id_t page_id = xtensor->get_phy_page_id(page_aligned_offset);
+  if (page_id < 0) {
+    return INVALID_OFFSET;
+  }
+  return static_cast<uint64_t>(page_id) * layout.page_size + offset_within_page;
+}
+
 std::vector<torch::Tensor> XTensorAllocator::create_tensors_internal_(
     size_t size,
     const std::vector<int64_t>& dims,
@@ -864,43 +1071,38 @@ std::pair<uint64_t, uint64_t> XTensorAllocator::get_global_offsets_for_block(
     return {INVALID_OFFSET, INVALID_OFFSET};
   }
 
-  // Calculate the offset within the XTensor for this block
-  // The offset must be aligned to page_size
-  size_t page_size = FLAGS_phy_page_granularity_size;
-  offset_t local_offset =
-      static_cast<offset_t>((block_id * block_size / page_size) * page_size);
+  (void)block_size;
+  const auto& layout = tensors->kv_layout;
+  if (!layout.valid()) {
+    LOG(ERROR) << "KV layout not initialized for model " << model_id;
+    return {INVALID_OFFSET, INVALID_OFFSET};
+  }
 
-  // Get K tensor's physical page_id at this offset
   auto* k_xtensor = tensors->k_tensors[layer_id].get();
-  page_id_t k_page_id = k_xtensor->get_phy_page_id(local_offset);
-  if (k_page_id < 0) {
-    LOG(ERROR) << "K cache block " << block_id << " at layer " << layer_id
-               << " is not mapped (local_offset=" << local_offset << ")";
-    return {INVALID_OFFSET, INVALID_OFFSET};
-  }
-
-  // Get V tensor's physical page_id at this offset
   auto* v_xtensor = tensors->v_tensors[layer_id].get();
-  page_id_t v_page_id = v_xtensor->get_phy_page_id(local_offset);
-  if (v_page_id < 0) {
-    LOG(ERROR) << "V cache block " << block_id << " at layer " << layer_id
-               << " is not mapped (local_offset=" << local_offset << ")";
+  const uint64_t k_global_offset =
+      get_global_offset_for_tensor_block_(k_xtensor,
+                                          layout,
+                                          layout.k_block_bytes,
+                                          layout.k_pages_per_virt_page,
+                                          block_id);
+  const uint64_t v_global_offset =
+      get_global_offset_for_tensor_block_(v_xtensor,
+                                          layout,
+                                          layout.v_block_bytes,
+                                          layout.v_pages_per_virt_page,
+                                          block_id);
+  if (k_global_offset == INVALID_OFFSET || v_global_offset == INVALID_OFFSET) {
+    LOG(ERROR) << "Failed to calculate KV global offsets for model " << model_id
+               << " layer=" << layer_id << " block=" << block_id;
     return {INVALID_OFFSET, INVALID_OFFSET};
   }
-
-  // Calculate GlobalXTensor offsets using page_id
-  // GlobalXTensor offset = page_id * page_size + (block offset within page)
-  size_t offset_within_page = (block_id * block_size) % page_size;
-
-  uint64_t k_global_offset =
-      static_cast<uint64_t>(k_page_id) * page_size + offset_within_page;
-  uint64_t v_global_offset =
-      static_cast<uint64_t>(v_page_id) * page_size + offset_within_page;
 
   VLOG(2) << "get_global_offsets_for_block: model=" << model_id
           << ", layer=" << layer_id << ", block=" << block_id
-          << ", block_size=" << block_size << ", k_page_id=" << k_page_id
-          << ", v_page_id=" << v_page_id << ", k_offset=" << k_global_offset
+          << ", k_block_bytes=" << layout.k_block_bytes
+          << ", v_block_bytes=" << layout.v_block_bytes
+          << ", k_offset=" << k_global_offset
           << ", v_offset=" << v_global_offset;
 
   return {k_global_offset, v_global_offset};
@@ -911,8 +1113,8 @@ bool XTensorAllocator::get_xtensor_offsets(
     const std::string& model_id,
     const std::vector<int32_t>& block_ids,
     uint64_t block_size_bytes,
-    std::vector<std::pair<std::vector<uint64_t>, std::vector<uint64_t>>>&
-        layer_offsets) {
+    std::vector<XTensorLayerOffsets>& layer_offsets,
+    XTensorBlockBytes* block_bytes) {
   // The offsets of the xtensor in the same DP group as the master worker are
   // identical, so there is no need to fetch them via RPC.
   if (dp_rank == 0) {
@@ -925,12 +1127,21 @@ bool XTensorAllocator::get_xtensor_offsets(
 
     int64_t num_layers = tensors->num_layers;
     layer_offsets.resize(num_layers);
+    if (block_bytes != nullptr) {
+      block_bytes->k_block_bytes = tensors->kv_layout.k_block_bytes;
+      block_bytes->v_block_bytes = tensors->kv_layout.v_block_bytes;
+      block_bytes->index_block_bytes = tensors->kv_layout.index_block_bytes;
+    }
 
     for (int64_t layer_id = 0; layer_id < num_layers; ++layer_id) {
       std::vector<uint64_t> k_offsets;
       std::vector<uint64_t> v_offsets;
+      std::vector<uint64_t> index_offsets;
       k_offsets.reserve(block_ids.size());
       v_offsets.reserve(block_ids.size());
+      if (!tensors->index_tensors.empty()) {
+        index_offsets.reserve(block_ids.size());
+      }
 
       for (int32_t block_id : block_ids) {
         auto [k_offset, v_offset] = get_global_offsets_for_block(
@@ -942,8 +1153,24 @@ bool XTensorAllocator::get_xtensor_offsets(
         }
         k_offsets.push_back(k_offset);
         v_offsets.push_back(v_offset);
+        if (!tensors->index_tensors.empty()) {
+          const uint64_t index_offset = get_global_offset_for_tensor_block_(
+              tensors->index_tensors[layer_id].get(),
+              tensors->kv_layout,
+              tensors->kv_layout.index_block_bytes,
+              tensors->kv_layout.index_pages_per_virt_page,
+              block_id);
+          if (index_offset == UINT64_MAX) {
+            LOG(ERROR) << "Failed to get local index offset for block "
+                       << block_id << " at layer " << layer_id;
+            return false;
+          }
+          index_offsets.push_back(index_offset);
+        }
       }
-      layer_offsets[layer_id] = {std::move(k_offsets), std::move(v_offsets)};
+      layer_offsets[layer_id].k_offsets = std::move(k_offsets);
+      layer_offsets[layer_id].v_offsets = std::move(v_offsets);
+      layer_offsets[layer_id].index_offsets = std::move(index_offsets);
     }
 
     VLOG(1) << "get_xtensor_offsets (local): model_id=" << model_id
@@ -971,7 +1198,11 @@ bool XTensorAllocator::get_xtensor_offsets(
   auto future =
       client->get_xtensor_offsets_async(model_id, block_ids, block_size_bytes);
 
-  layer_offsets = std::move(future).get();
+  auto response = std::move(future).get();
+  layer_offsets = std::move(response.layer_offsets);
+  if (block_bytes != nullptr) {
+    *block_bytes = response.block_bytes;
+  }
   if (layer_offsets.empty()) {
     LOG(ERROR) << "get_xtensor_offsets failed for dp_rank=" << dp_rank
                << ", model_id=" << model_id;

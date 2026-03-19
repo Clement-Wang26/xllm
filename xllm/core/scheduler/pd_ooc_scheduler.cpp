@@ -130,13 +130,15 @@ PDOOCScheduler::~PDOOCScheduler() {
 }
 
 void PDOOCScheduler::start_rpc_server() {
+  const uint16_t disagg_pd_port = options_.disagg_pd_port().value_or(
+      static_cast<uint16_t>(FLAGS_disagg_pd_port));
   std::unique_ptr<PDOOCService> service =
       std::make_unique<PDOOCService>(this, engine_);
   auto rpc_server =
       ServerRegistry::get_instance().register_server(server_name_);
-  if (!rpc_server->start(std::move(service))) {
+  if (!rpc_server->start(std::move(service), disagg_pd_port)) {
     LOG(ERROR) << "Failed to start brpc disagg pd server on port "
-               << FLAGS_disagg_pd_port;
+               << disagg_pd_port;
     return;
   }
 }

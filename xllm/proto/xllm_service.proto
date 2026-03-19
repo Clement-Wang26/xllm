@@ -30,6 +30,8 @@ message MasterInfos {
   int32 dp_size = 7;
   // Per-remote-addr weight segments (index matches remote_addrs)
   repeated MasterWeightSegmentList src_weight_segments = 8;
+  // Optional disagg pd rpc port for forked master instances.
+  int32 disagg_pd_port = 9;
 }
 
 // A single weight segment for master wakeup

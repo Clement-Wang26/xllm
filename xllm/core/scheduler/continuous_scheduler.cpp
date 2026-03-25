@@ -208,6 +208,112 @@ bool ContinuousScheduler::check_if_enough_to_evict(
   return false;
 }
 
+void ContinuousScheduler::publish_prefill_blocks_to_prefix_cache(
+    const std::vector<Sequence*>& sequences,
+    const std::vector<size_t>& current_step_token_budgets) {
+  if (!enable_prefix_cache_ || sequences.empty()) {
+    return;
+  }
+  CHECK_EQ(sequences.size(), current_step_token_budgets.size());
+  for (size_t i = 0; i < sequences.size(); ++i) {
+    Sequence* sequence = sequences[i];
+    if (sequence == nullptr || !sequence->is_prefill_stage()) {
+      continue;
+    }
+    const size_t max_handle_num_tokens =
+        sequence->kv_state().kv_cache_tokens_num() +
+        current_step_token_budgets[i];
+    kv_cache_manager_->publish_full_blocks_to_prefix_cache(
+        sequence, max_handle_num_tokens);
+  }
+}
+
+void ContinuousScheduler::log_batch_prefill_cache_hit_rates() {
+  if (running_sequences_.empty()) {
+    return;
+  }
+
+  DCHECK_EQ(running_sequences_.size(), running_sequences_budgets_.size());
+
+  const size_t block_size = kv_cache_manager_->block_size();
+  size_t num_prefill_sequences = 0;
+  size_t prefix_hit_tokens = 0;
+  size_t prefill_kv_hit_tokens = 0;
+  size_t compute_tokens = 0;
+  size_t actual_compute_tokens = 0;
+
+  for (size_t i = 0; i < running_sequences_.size(); ++i) {
+    Sequence* sequence = running_sequences_[i];
+    if (sequence == nullptr || !sequence->is_prefill_stage()) {
+      continue;
+    }
+
+    ++num_prefill_sequences;
+    const size_t shared_prefix_tokens =
+        std::max(sequence->kv_state().shared_kv_blocks_num(),
+                 sequence->host_kv_state().shared_kv_blocks_num()) *
+        block_size;
+    prefix_hit_tokens += shared_prefix_tokens;
+    prefill_kv_hit_tokens += sequence->kv_cache_tokens_num();
+    // running_sequences_budgets_ is captured before schedule-time cache match,
+    // so it may overestimate the tokens that really need computation.
+    const size_t scheduled_sequence_compute_tokens =
+        running_sequences_budgets_[i];
+    const size_t actual_sequence_compute_tokens = std::min(
+        sequence->num_need_compute_tokens(), scheduled_sequence_compute_tokens);
+    compute_tokens += scheduled_sequence_compute_tokens;
+    actual_compute_tokens += actual_sequence_compute_tokens;
+  }
+
+  const size_t schedule_time_cache_hit_tokens =
+      compute_tokens - actual_compute_tokens;
+  const size_t non_prefix_cached_tokens =
+      prefill_kv_hit_tokens > prefix_hit_tokens
+          ? prefill_kv_hit_tokens - prefix_hit_tokens
+          : 0;
+  const size_t prefix_total_tokens = prefix_hit_tokens + compute_tokens;
+  const size_t prefill_kv_total_tokens = prefill_kv_hit_tokens + compute_tokens;
+  const size_t actual_prefix_total_tokens =
+      prefix_hit_tokens + actual_compute_tokens;
+  const size_t actual_prefill_kv_total_tokens =
+      prefill_kv_hit_tokens + actual_compute_tokens;
+  const double prefix_hit_rate =
+      prefix_total_tokens == 0
+          ? 0.0
+          : static_cast<double>(prefix_hit_tokens) / prefix_total_tokens;
+  const double prefill_kv_hit_rate =
+      prefill_kv_total_tokens == 0
+          ? 0.0
+          : static_cast<double>(prefill_kv_hit_tokens) /
+                prefill_kv_total_tokens;
+  const double actual_prefix_hit_rate =
+      actual_prefix_total_tokens == 0
+          ? 0.0
+          : static_cast<double>(prefix_hit_tokens) / actual_prefix_total_tokens;
+  const double actual_prefill_kv_hit_rate =
+      actual_prefill_kv_total_tokens == 0
+          ? 0.0
+          : static_cast<double>(prefill_kv_hit_tokens) /
+                actual_prefill_kv_total_tokens;
+
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(4)
+     << "Batch prefill cache hit rates: total_seqs="
+     << running_sequences_.size() << ", prefill_seqs=" << num_prefill_sequences
+     << ", decode_seqs=" << running_sequences_.size() - num_prefill_sequences
+     << ", prefix_hit_tokens=" << prefix_hit_tokens
+     << ", prefill_kv_hit_tokens=" << prefill_kv_hit_tokens
+     << ", compute_tokens=" << compute_tokens
+     << ", actual_compute_tokens=" << actual_compute_tokens
+     << ", schedule_time_cache_hit_tokens=" << schedule_time_cache_hit_tokens
+     << ", non_prefix_cached_tokens=" << non_prefix_cached_tokens
+     << ", prefix_hit_rate=" << prefix_hit_rate
+     << ", prefill_kv_hit_rate=" << prefill_kv_hit_rate
+     << ", actual_prefix_hit_rate=" << actual_prefix_hit_rate
+     << ", actual_prefill_kv_hit_rate=" << actual_prefill_kv_hit_rate;
+  LOG(INFO) << os.str();
+}
+
 void ContinuousScheduler::handle_prefill_requests(
     double& latency_budget,
     double& estimate_latency,
@@ -375,6 +481,8 @@ void ContinuousScheduler::handle_prefill_requests(
     running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                       prefill_sequences_budget.begin(),
                                       prefill_sequences_budget.end());
+    publish_prefill_blocks_to_prefix_cache(prefill_sequences,
+                                           prefill_sequences_budget);
   }
   // maybe can pre-compute if prompt beyond length
   if (running_sequences_.empty() && !waiting_priority_queue.empty() &&
@@ -963,6 +1071,9 @@ std::vector<Batch> ContinuousScheduler::prepare_batch() {
     kv_cache_manager_->transfer_blocks(batches);
   } else {
     kv_cache_manager_->transfer_blocks();
+  }
+  if (!is_batches_empty) {
+    log_batch_prefill_cache_hit_rates();
   }
 
   GAUGE_SET(num_pending_requests,

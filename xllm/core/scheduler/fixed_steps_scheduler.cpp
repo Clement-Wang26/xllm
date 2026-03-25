@@ -280,6 +280,7 @@ std::vector<Batch> FixedStepsScheduler::prepare_batch() {
   if (!batches[0].empty()) {
     // only update the scheduling latency when there are requests to process
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());
+    log_batch_prefill_cache_hit_rates();
   }
 
   GAUGE_SET(num_pending_requests,

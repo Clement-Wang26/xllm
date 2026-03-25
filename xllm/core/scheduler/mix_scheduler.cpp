@@ -394,6 +394,8 @@ void MixScheduler::handle_running_queue_requests(
       running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                         candidate_token_budgets.begin(),
                                         candidate_token_budgets.end());
+      publish_prefill_blocks_to_prefix_cache(candidate_sequences,
+                                             candidate_token_budgets);
       remaining_token_budget -= allocated_tokens;
       remaining_seq_budget -= allocated_seqs;
       remaining_copy_blocks_budget -= allocated_copy_blocks;
@@ -586,6 +588,9 @@ std::vector<Batch> MixScheduler::prepare_batch() {
     kv_cache_manager_->transfer_blocks(batches);
   } else {
     kv_cache_manager_->transfer_blocks();
+  }
+  if (!is_batches_empty) {
+    log_batch_prefill_cache_hit_rates();
   }
 
   GAUGE_SET(num_pending_requests,

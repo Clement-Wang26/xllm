@@ -164,6 +164,7 @@ Sequence::Sequence(const Sequence& other)
           other.time_to_first_token_latency_seconds_),
       is_first_token_(other.is_first_token_),
       is_cache_block_for_prefill_(other.is_cache_block_for_prefill_),
+      published_prefix_blocks_num_(other.published_prefix_blocks_num_),
       sequence_params_(other.sequence_params_),
       decoder_(other.decoder_),
       tokens_(other.tokens_),
@@ -540,6 +541,7 @@ void Sequence::reset() {
   host_kv_state_.reset();
   timer_.reset();
   is_timeout_set_ = false;
+  published_prefix_blocks_num_ = 0;
   volatile_num_prompt_tokens_ = num_tokens_;
 }
 

@@ -203,6 +203,14 @@ class Sequence final {
     return if_cache;
   }
 
+  size_t published_prefix_blocks_num() const {
+    return published_prefix_blocks_num_;
+  }
+
+  void set_published_prefix_blocks_num(size_t num_blocks) {
+    published_prefix_blocks_num_ = num_blocks;
+  }
+
   FinishReason finish_reason() const { return finish_reason_; }
   // check finish status, use cached value if not invalidated
   bool finished() const;
@@ -413,6 +421,10 @@ class Sequence final {
 
   // whether the prefill stage has been cached.
   bool is_cache_block_for_prefill_ = false;
+
+  // Number of full KV blocks that have already been published to the global
+  // prefix cache for the current sequence lifetime.
+  size_t published_prefix_blocks_num_ = 0;
 
   SequenceParams sequence_params_;
 

@@ -15,6 +15,8 @@ limitations under the License.
 
 #include "block_manager_pool.h"
 
+#include <algorithm>
+
 #include "block_manager_impl.h"
 #include "common/global_flags.h"
 #include "concurrent_block_manager_impl.h"
@@ -279,12 +281,40 @@ void BlockManagerPool::allocate_shared(Sequence* sequence) {
 }
 
 void BlockManagerPool::cache(Sequence* sequence) {
+  publish_full_blocks_to_prefix_cache(sequence,
+                                      sequence->kv_state().kv_cache_tokens_num());
+}
+
+void BlockManagerPool::publish_full_blocks_to_prefix_cache(
+    Sequence* sequence,
+    size_t num_tokens) {
+  DCHECK(sequence != nullptr);
+  if (!options_.enable_prefix_cache()) {
+    return;
+  }
+
+  const size_t block_size = options_.block_size();
+  const size_t available_sequence_blocks_num =
+      sequence->tokens().size() / block_size;
+  const size_t target_published_blocks_num =
+      std::min({num_tokens / block_size,
+                sequence->kv_state().num_kv_blocks(),
+                available_sequence_blocks_num});
+  const size_t published_prefix_blocks_num =
+      std::max(sequence->published_prefix_blocks_num(),
+               sequence->kv_state().shared_kv_blocks_num());
+  if (target_published_blocks_num <= published_prefix_blocks_num) {
+    return;
+  }
+
   int32_t dp_rank = get_dp_rank(sequence);
-  const auto token_ids = sequence->cached_tokens();
+  const auto token_ids =
+      sequence->tokens().slice(0, target_published_blocks_num * block_size);
   auto* blocks = sequence->kv_state().mutable_kv_blocks();
-  auto existed_shared_blocks_num = sequence->kv_state().shared_kv_blocks_num();
+  CHECK_GE(blocks->size(), target_published_blocks_num);
   block_managers_[dp_rank]->cache(
-      token_ids, *blocks, existed_shared_blocks_num);
+      token_ids, *blocks, published_prefix_blocks_num);
+  sequence->set_published_prefix_blocks_num(target_published_blocks_num);
 }
 
 void BlockManagerPool::get_merged_kvcache_event(KvCacheEvent* event) const {

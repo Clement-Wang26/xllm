@@ -289,6 +289,12 @@ class ContinuousScheduler : public Scheduler {
                                 size_t max_handle_num_tokens,
                                 size_t& num_request_to_evict);
 
+  void publish_prefill_blocks_to_prefix_cache(
+      const std::vector<Sequence*>& sequences,
+      const std::vector<size_t>& current_step_token_budgets);
+
+  void log_batch_prefill_cache_hit_rates();
+
   // build a batch of requests from the priority queue
   virtual std::vector<Batch> prepare_batch();
 

@@ -166,6 +166,8 @@ void ChunkedPrefillScheduler::handle_running_queue_requests(
       running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                         candidate_token_budgets.begin(),
                                         candidate_token_budgets.end());
+      publish_prefill_blocks_to_prefix_cache(candidate_sequences,
+                                             candidate_token_budgets);
       remaining_token_budget -= allocated_tokens;
       remaining_seq_budget -= allocated_seqs;
       estimate_latency += allocated_estimate_latency;
@@ -399,6 +401,8 @@ void ChunkedPrefillScheduler::handle_prefill_requests(
     running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                       prefill_sequences_budget.begin(),
                                       prefill_sequences_budget.end());
+    publish_prefill_blocks_to_prefix_cache(prefill_sequences,
+                                           prefill_sequences_budget);
   }
   // maybe can pre-compute if prompt beyond length
   if (running_sequences_.empty() && !waiting_priority_queue.empty() &&
@@ -694,6 +698,7 @@ std::vector<Batch> ChunkedPrefillScheduler::prepare_batch() {
   if (!is_batches_empty) {
     // only update the scheduling latency when there are requests to process
     COUNTER_ADD(scheduling_latency_seconds, timer.elapsed_seconds());
+    log_batch_prefill_cache_hit_rates();
   }
 
   GAUGE_SET(num_pending_requests,

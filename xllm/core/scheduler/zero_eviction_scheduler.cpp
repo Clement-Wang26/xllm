@@ -404,6 +404,8 @@ void ZeroEvictionScheduler::handle_prefill_requests(
     running_sequences_budgets_.insert(running_sequences_budgets_.end(),
                                       prefill_sequences_budget.begin(),
                                       prefill_sequences_budget.end());
+    publish_prefill_blocks_to_prefix_cache(prefill_sequences,
+                                           prefill_sequences_budget);
   }
 
   if (running_sequences_.empty() && !waiting_priority_queue_.empty() &&

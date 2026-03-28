@@ -98,6 +98,7 @@ NpuLmHeadImpl::NpuLmHeadImpl(const ModelContext& context) : BaseLayer(context) {
 
   if (FLAGS_enable_manual_loader) {
     loader_ = std::make_unique<LmHeadManualLoader>(1, context);
+    get_manual_loader()->set_pinned_host_cache_component_key("lm_head");
   } else {
     loader_ = std::make_unique<LmHeadLoader>(1, context);
   }

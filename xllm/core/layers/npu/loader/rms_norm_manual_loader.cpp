@@ -28,12 +28,18 @@ RMSNormManualLoader::RMSNormManualLoader(uint64_t weight_count,
 }
 
 void RMSNormManualLoader::load_state_dict(const StateDict& state_dict) {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   set_weight(state_dict, "weight", 0, true);
   at_host_weight_tensors_[0] = at_host_weight_tensors_[0].to(dtype_);
 }
 
 void RMSNormManualLoader::verify_loaded_weights(
     const std::string& weight_str) const {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   CHECK(at_host_weight_tensors_[0].sizes() != std::vector<int64_t>({1}))
       << "final norm weight is not loaded for " << weight_str;
 }

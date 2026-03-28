@@ -58,6 +58,7 @@ cc_library(
     loader/siglip_encoder_loader.h
     loader/base_loader.h
     loader/base_manual_loader.h
+    loader/pinned_host_memory_cache.h
     loader/qwen2_decoder_manual_loader.h
     loader/qwen3_decoder_manual_loader.h
     loader/eagle3_decoder_manual_loader.h
@@ -116,6 +117,7 @@ cc_library(
     loader/siglip_encoder_loader.cpp
     loader/base_loader.cpp
     loader/base_manual_loader.cpp
+    loader/pinned_host_memory_cache.cpp
     loader/qwen2_decoder_manual_loader.cpp
     loader/qwen3_decoder_manual_loader.cpp
     loader/eagle3_decoder_manual_loader.cpp

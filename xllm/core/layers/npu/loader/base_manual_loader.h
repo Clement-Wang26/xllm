@@ -15,7 +15,11 @@ limitations under the License.
 
 #pragma once
 
+#include <memory>
+#include <string>
+
 #include "base_loader.h"
+#include "pinned_host_memory_cache.h"
 #include "rolling_weight_buffer.h"
 
 namespace xllm {
@@ -23,9 +27,14 @@ namespace layer {
 
 class BaseManualLoader : public BaseLoader {
  public:
+  using WeightSlice = PinnedHostMemoryWeightSlice;
+
   BaseManualLoader(uint64_t weight_count, const ModelContext& context);
 
   virtual ~BaseManualLoader() override;
+
+  bool prepare_pinned_host_cache();
+  void set_pinned_host_cache_component_key(std::string component_key);
 
   virtual void copy_weights_to_pinned_host();
 
@@ -66,15 +75,12 @@ class BaseManualLoader : public BaseLoader {
   void allocate_device_storage();
 
  protected:
-  struct WeightSlice {
-    uint64_t offset = 0;
-    uint64_t bytes = 0;
-    std::vector<int64_t> sizes;
-    torch::ScalarType dtype = torch::kFloat16;
-  };
-
   virtual void merge_host_at_weights() = 0;
+  bool is_pinned_host_cache_hit() const { return pinned_host_cache_hit_; }
+  std::string build_pinned_host_cache_key() const;
+
   std::string model_id_;
+  std::string model_path_;
   void* host_pinned_storage_ = nullptr;
   void* device_storage_ = nullptr;
   uint64_t storage_size_ = 0;
@@ -89,6 +95,10 @@ class BaseManualLoader : public BaseLoader {
 
   std::shared_ptr<RollingWeightBuffer> rolling_buffer_ = nullptr;
   int32_t layer_index_ = -1;
+  std::string pinned_host_cache_component_key_;
+  std::string pinned_host_cache_key_;
+  std::shared_ptr<PinnedHostMemoryEntry> pinned_host_cache_entry_ = nullptr;
+  bool pinned_host_cache_hit_ = false;
   int copy_host_nd_to_nz(torch::Tensor host_tensor,
                          void* dst_ptr,
                          uint64_t len,

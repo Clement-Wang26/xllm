@@ -171,6 +171,9 @@ Eagle3DecoderManualLoader::Eagle3DecoderManualLoader(
 }
 
 void Eagle3DecoderManualLoader::load_state_dict(const StateDict& state_dict) {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   if (quantize_type_ == "w8a8") {
     for (const auto& [index, name] : WEIGHT_MAPPING_W8A8) {
       if (WEIGHT_SHARD_W8A8.find(index) != WEIGHT_SHARD_W8A8.end()) {
@@ -211,6 +214,9 @@ void Eagle3DecoderManualLoader::merge_loaded_weights() {
 }
 
 void Eagle3DecoderManualLoader::merge_and_move_pinned_host() {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   merge_host_at_weights();
   init_weight_slices();
   copy_weights_to_pinned_host();
@@ -336,6 +342,9 @@ TransposeType Eagle3DecoderManualLoader::check_transpose(at::Tensor& tensor) {
 }
 
 void Eagle3DecoderManualLoader::verify_loaded_weights() const {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   for (const auto& [index, name] : WEIGHT_MAPPING) {
     CHECK(at_host_weight_tensors_[index].sizes() != std::vector<int64_t>({1}))
         << "weight is not loaded for " << name;

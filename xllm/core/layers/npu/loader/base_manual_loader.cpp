@@ -15,6 +15,11 @@ limitations under the License.
 
 #include "base_manual_loader.h"
 
+#include <algorithm>
+#include <cstddef>
+#include <cstring>
+#include <filesystem>
+
 #include "core/common/global_flags.h"
 #include "framework/xtensor/xtensor_allocator.h"
 
@@ -38,6 +43,39 @@ static inline size_t AlignUp(size_t value, size_t alignment) {
 BaseManualLoader::~BaseManualLoader() {
   release_host_storage();
   release_device_storage();
+}
+
+bool BaseManualLoader::prepare_pinned_host_cache() {
+  if (!FLAGS_enable_manual_loader || pinned_host_cache_component_key_.empty() ||
+      model_path_.empty()) {
+    return false;
+  }
+  if (pinned_host_cache_entry_ != nullptr) {
+    return pinned_host_cache_hit_;
+  }
+
+  pinned_host_cache_key_ = build_pinned_host_cache_key();
+  bool cache_hit = false;
+  pinned_host_cache_entry_ = PinnedHostMemoryCache::get_instance()
+                                 .acquire_or_create(pinned_host_cache_key_,
+                                                    &cache_hit);
+  pinned_host_cache_hit_ = cache_hit;
+  if (pinned_host_cache_hit_) {
+    CHECK(pinned_host_cache_entry_ != nullptr)
+        << "Pinned host cache hit without cache entry";
+    host_pinned_storage_ = pinned_host_cache_entry_->host_pinned_storage;
+    storage_size_ = pinned_host_cache_entry_->storage_size;
+    weight_slices_ = pinned_host_cache_entry_->weight_slices;
+    LOG(INFO) << "Pinned host cache hit for " << pinned_host_cache_key_;
+  } else {
+    LOG(INFO) << "Pinned host cache miss for " << pinned_host_cache_key_;
+  }
+  return pinned_host_cache_hit_;
+}
+
+void BaseManualLoader::set_pinned_host_cache_component_key(
+    std::string component_key) {
+  pinned_host_cache_component_key_ = std::move(component_key);
 }
 
 void BaseManualLoader::free_weights() { release_host_storage(); }
@@ -117,6 +155,9 @@ void BaseManualLoader::init_weight_slices() {
 }
 
 void BaseManualLoader::copy_weights_to_pinned_host() {
+  if (pinned_host_cache_hit_) {
+    return;
+  }
   CHECK_GT(storage_size_, 0) << "model size must be greater than 0.";
   CHECK_EQ(weight_slices_.size(), at_host_weight_tensors_.size())
       << "weight_slices_ size and at_host_weight_tensors_ size mismatch.";
@@ -124,9 +165,15 @@ void BaseManualLoader::copy_weights_to_pinned_host() {
   size_t max_alignment = std::max(kHostAlignment, kDeviceAlignment);
   storage_size_ = AlignUp(storage_size_, max_alignment);
 
-  auto ret = aclrtMallocHost(&host_pinned_storage_, storage_size_);
-  CHECK_EQ(ret, ACL_SUCCESS)
-      << "Failed to allocate pinned host storage size=" << storage_size_;
+  if (pinned_host_cache_entry_ != nullptr) {
+    host_pinned_storage_ = PinnedHostMemoryCache::get_instance()
+                               .allocate_host_storage(pinned_host_cache_entry_,
+                                                      storage_size_);
+  } else {
+    auto ret = aclrtMallocHost(&host_pinned_storage_, storage_size_);
+    CHECK_EQ(ret, ACL_SUCCESS)
+        << "Failed to allocate pinned host storage size=" << storage_size_;
+  }
 
   for (size_t i = 0; i < weight_slices_.size(); ++i) {
     const auto& slice = weight_slices_[i];
@@ -146,6 +193,11 @@ void BaseManualLoader::copy_weights_to_pinned_host() {
       std::memcpy(dst, host_tensor.data_ptr(), slice.bytes);
     }
     at_host_weight_tensors_[i] = torch::zeros({1});
+  }
+
+  if (pinned_host_cache_entry_ != nullptr) {
+    PinnedHostMemoryCache::get_instance().publish(
+        pinned_host_cache_entry_, storage_size_, weight_slices_);
   }
 }
 
@@ -247,7 +299,14 @@ void BaseManualLoader::release_device_storage() {
 }
 
 void BaseManualLoader::release_host_storage() {
-  if (host_pinned_storage_ == nullptr) {
+  if (host_pinned_storage_ == nullptr && pinned_host_cache_entry_ == nullptr) {
+    return;
+  }
+  if (pinned_host_cache_entry_ != nullptr) {
+    PinnedHostMemoryCache::get_instance().release(pinned_host_cache_entry_);
+    pinned_host_cache_entry_.reset();
+    pinned_host_cache_hit_ = false;
+    host_pinned_storage_ = nullptr;
     return;
   }
   auto ret = aclrtFreeHost(host_pinned_storage_);
@@ -259,7 +318,9 @@ void BaseManualLoader::release_host_storage() {
 
 BaseManualLoader::BaseManualLoader(uint64_t weight_count,
                                    const ModelContext& context)
-    : BaseLoader(weight_count, context), model_id_(context.get_model_id()) {
+    : BaseLoader(weight_count, context),
+      model_id_(context.get_model_id()),
+      model_path_(context.get_model_path()) {
   at_host_weight_tensors_.resize(weight_count_);
 }
 
@@ -271,9 +332,26 @@ void BaseManualLoader::merge_loaded_weights() {
 }
 
 void BaseManualLoader::merge_and_move_pinned_host() {
+  if (pinned_host_cache_hit_) {
+    return;
+  }
   merge_host_at_weights();
   init_weight_slices();
   copy_weights_to_pinned_host();
+}
+
+std::string BaseManualLoader::build_pinned_host_cache_key() const {
+  CHECK(!pinned_host_cache_component_key_.empty())
+      << "Pinned host cache component key is empty";
+  CHECK(!model_path_.empty()) << "Pinned host cache model_path is empty";
+
+  const std::string normalized_model_path =
+      std::filesystem::path(model_path_).lexically_normal().string();
+  return normalized_model_path + "|component=" +
+         pinned_host_cache_component_key_ + "|rank=" +
+         std::to_string(parallel_args_.rank()) + "|world_size=" +
+         std::to_string(parallel_args_.world_size()) + "|dtype=" +
+         torch_dtype_ + "|quant=" + quantize_type_;
 }
 
 torch::Tensor BaseManualLoader::convert_to_torch_tensor(

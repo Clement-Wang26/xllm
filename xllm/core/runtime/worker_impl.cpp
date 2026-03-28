@@ -894,6 +894,7 @@ bool WorkerImpl::init_model(const std::string& model_weights_path,
   auto tensor_options = torch::dtype(dtype_).device(device_);
   context_ = ModelContext(parallel_args_, args, quant_args, tensor_options);
   context_.set_model_id(options_.model_id());
+  context_.set_model_path(model_weights_path_);
 
   // init model, create model executor
   bool status = this->init_model(context_);

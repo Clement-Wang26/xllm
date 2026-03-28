@@ -168,6 +168,9 @@ Qwen2DecoderManualLoader::Qwen2DecoderManualLoader(uint64_t weight_count,
 }
 
 void Qwen2DecoderManualLoader::load_state_dict(const StateDict& state_dict) {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   if (quantize_type_ == "w8a8") {
     for (const auto& [index, name] : WEIGHT_MAPPING_W8A8) {
       if (WEIGHT_SHARD_W8A8.find(index) != WEIGHT_SHARD_W8A8.end()) {
@@ -301,6 +304,9 @@ void Qwen2DecoderManualLoader::merge_host_at_weights() {
 }
 
 void Qwen2DecoderManualLoader::verify_loaded_weights() const {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   for (const auto& [index, name] : WEIGHT_MAPPING) {
     CHECK(at_host_weight_tensors_[index].sizes() != std::vector<int64_t>({1}))
         << "weight is not loaded for " << name;

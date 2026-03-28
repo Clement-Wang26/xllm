@@ -34,6 +34,7 @@ NpuRMSNormImpl::NpuRMSNormImpl(const ModelContext& context)
 
   if (FLAGS_enable_manual_loader) {
     loader_ = std::make_unique<RMSNormManualLoader>(1, context);
+    get_manual_loader()->set_pinned_host_cache_component_key("norm");
   } else {
     loader_ = std::make_unique<RMSNormLoader>(1, context);
   }

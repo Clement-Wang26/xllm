@@ -26,6 +26,9 @@ LmHeadManualLoader::LmHeadManualLoader(uint64_t weight_count,
 }
 
 void LmHeadManualLoader::load_state_dict(const StateDict& state_dict) {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   if (dp_size_ > 1) {
     set_weight(
         state_dict, "weight", 0, 1, dp_local_tp_rank_, dp_local_tp_size_, true);
@@ -36,6 +39,9 @@ void LmHeadManualLoader::load_state_dict(const StateDict& state_dict) {
 
 void LmHeadManualLoader::verify_loaded_weights(
     const std::string& weight_str) const {
+  if (is_pinned_host_cache_hit()) {
+    return;
+  }
   CHECK(at_host_weight_tensors_[0].sizes() != std::vector<int64_t>({1}))
       << "final lm_head weight is not loaded for " << weight_str;
 }

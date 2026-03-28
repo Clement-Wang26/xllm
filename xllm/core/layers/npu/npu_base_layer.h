@@ -200,6 +200,14 @@ class BaseLayer : public torch::nn::Module {
     return dynamic_cast<BaseManualLoader*>(loader_.get());
   }
 
+  virtual bool prepare_cached_pinned_host() {
+    auto* manual_loader = get_manual_loader();
+    if (manual_loader == nullptr) {
+      return false;
+    }
+    return manual_loader->prepare_pinned_host_cache();
+  }
+
   virtual int64_t init_layer() { return 0; };
 
   virtual void run_task(std::string taskName, std::function<int()> task) const;

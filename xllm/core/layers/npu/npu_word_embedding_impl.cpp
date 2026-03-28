@@ -64,6 +64,7 @@ NpuWordEmbeddingImpl::NpuWordEmbeddingImpl(const ModelContext& context)
 
   if (FLAGS_enable_manual_loader) {
     loader_ = std::make_unique<WordEmbeddingManualLoader>(1, context);
+    get_manual_loader()->set_pinned_host_cache_component_key("embed_tokens");
   } else {
     loader_ = std::make_unique<WordEmbeddingLoader>(1, context);
   }

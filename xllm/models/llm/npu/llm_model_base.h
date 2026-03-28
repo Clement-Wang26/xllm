@@ -56,6 +56,11 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
     // register submodules
     decoder_layer_ = register_module("decoder_layer", DecoderType(context));
     block_copy_ = register_module("block_copy", layer::NpuBlockCopy(context));
+    auto* manual_loader = decoder_layer_->get_manual_loader();
+    if (manual_loader != nullptr) {
+      manual_loader->set_pinned_host_cache_component_key(
+          "decoder_layer_" + std::to_string(layer_id_));
+    }
   }
 
   virtual torch::Tensor forward(torch::Tensor& x,
@@ -115,6 +120,10 @@ class LlmDecoderLayerImplBase : public torch::nn::Module {
 
   virtual layer::BaseManualLoader* get_manual_loader() {
     return decoder_layer_->get_manual_loader();
+  }
+
+  virtual bool prepare_cached_pinned_host() {
+    return decoder_layer_->prepare_cached_pinned_host();
   }
 
   virtual void refresh_rolling_weights() {
@@ -337,6 +346,15 @@ class LlmModelImplBase : public torch::nn::Module {
     return loaders;
   }
 
+  virtual bool prepare_cached_pinned_host_weights() {
+    bool all_cached = npu_embed_tokens_->prepare_cached_pinned_host();
+    for (auto& layer : layers_) {
+      all_cached = layer->prepare_cached_pinned_host() && all_cached;
+    }
+    all_cached = norm_->prepare_cached_pinned_host() && all_cached;
+    return all_cached;
+  }
+
   // Inject rolling load manager (not owned, managed by WorkerImpl)
   void set_rolling_load_manager(RollingLoadManager* mgr) { rolling_mgr_ = mgr; }
 
@@ -475,8 +493,24 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
       LOG(INFO) << "Model weights are already kept on host.";
       return;
     }
+    const bool model_cache_hit =
+        prepare_model_cached_pinned_host_weights(model_);
+    const bool lm_head_cache_hit = npu_lm_head_->prepare_cached_pinned_host();
+    if (model_cache_hit && lm_head_cache_hit) {
+      LOG(INFO) << "Pinned host cache hit for all manual loaders, skip "
+                   "checkpoint loading";
+      model_->merge_and_move_pinned_host();
+      npu_lm_head_->merge_and_move_pinned_host();
+      keep_host_weights = true;
+      return;
+    }
     for (const auto& state_dict : loader->get_state_dicts()) {
-      model_->load_state_dict(state_dict->get_dict_with_prefix(prefix));
+      model_->load_state_dict(state_dict->get_dict_with_prefix(
+          std::vector<std::string>{"model.language_model.",
+                                   "language_model.model.",
+                                   prefix,
+                                   "model.",
+                                   ""}));
       if (tie_word_embeddings) {
         npu_lm_head_->load_state_dict(
             state_dict->get_dict_with_prefix(prefix + "embed_tokens."));
@@ -487,7 +521,11 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
     }
     // verify
     model_->verify_loaded_weights(prefix);
-    npu_lm_head_->verify_loaded_weights("lm_head.");
+    if (tie_word_embeddings) {
+      npu_lm_head_->verify_loaded_weights("embed_tokens.");
+    } else {
+      npu_lm_head_->verify_loaded_weights("lm_head.");
+    }
 
     model_->merge_and_move_pinned_host();
     // test
@@ -614,6 +652,17 @@ class LlmForCausalLMImplBase : public torch::nn::Module {
   std::unique_ptr<RollingLoadManager> rolling_load_manager_{nullptr};
   // test
   layer::NpuLmHead npu_lm_head_{nullptr};
+
+ private:
+  template <typename ModelHolder>
+  static bool prepare_model_cached_pinned_host_weights(ModelHolder& model) {
+    if constexpr (requires(ModelHolder& m) {
+                    m->prepare_cached_pinned_host_weights();
+                  }) {
+      return model->prepare_cached_pinned_host_weights();
+    }
+    return false;
+  }
 };
 
 }  // namespace xllm::npu::model

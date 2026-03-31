@@ -34,6 +34,11 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
     // register submodules
     decoder_layer_ = register_module(
         "decoder_layer", layer::NpuDeepseekV2DecoderLayer(context, i));
+    auto* manual_loader = decoder_layer_->get_manual_loader();
+    if (manual_loader != nullptr) {
+      manual_loader->set_pinned_host_cache_component_key(
+          "decoder_layer_" + std::to_string(i));
+    }
   }
 
   torch::Tensor forward(torch::Tensor& x,
@@ -78,6 +83,10 @@ class DeepseekV2DecoderLayerImpl : public torch::nn::Module {
 
   layer::BaseManualLoader* get_manual_loader() {
     return decoder_layer_->get_manual_loader();
+  }
+
+  bool prepare_cached_pinned_host() {
+    return decoder_layer_->prepare_cached_pinned_host();
   }
 
   void refresh_rolling_weights() { decoder_layer_->refresh_rolling_weights(); }
@@ -242,6 +251,15 @@ class DeepseekV2ModelImpl : public torch::nn::Module {
       layers_[i]->merge_and_move_pinned_host();
     }
     norm_->merge_and_move_pinned_host();
+  }
+
+  bool prepare_cached_pinned_host_weights() {
+    bool all_cached = npu_embed_tokens_->prepare_cached_pinned_host();
+    for (auto& layer : layers_) {
+      all_cached = layer->prepare_cached_pinned_host() && all_cached;
+    }
+    all_cached = norm_->prepare_cached_pinned_host() && all_cached;
+    return all_cached;
   }
 
   void free_weights() {

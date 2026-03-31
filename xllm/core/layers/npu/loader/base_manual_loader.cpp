@@ -19,6 +19,7 @@ limitations under the License.
 #include <cstddef>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 
 #include "core/common/global_flags.h"
 #include "framework/xtensor/xtensor_allocator.h"
@@ -64,11 +65,20 @@ bool BaseManualLoader::prepare_pinned_host_cache() {
     CHECK(pinned_host_cache_entry_ != nullptr)
         << "Pinned host cache hit without cache entry";
     host_pinned_storage_ = pinned_host_cache_entry_->host_pinned_storage;
+    host_pinned_segments_ = pinned_host_cache_entry_->host_pinned_segments;
     storage_size_ = pinned_host_cache_entry_->storage_size;
     weight_slices_ = pinned_host_cache_entry_->weight_slices;
+    refresh_host_pinned_storage_alias();
     LOG(INFO) << "Pinned host cache hit for " << pinned_host_cache_key_;
   } else {
     LOG(INFO) << "Pinned host cache miss for " << pinned_host_cache_key_;
+  }
+  if (can_copy_pinned_host_from_device()) {
+    copy_weights_to_pinned_host();
+    pinned_host_cache_hit_ = true;
+    LOG(INFO) << "Pinned host cache populated from device for "
+              << pinned_host_cache_key_;
+    return true;
   }
   return pinned_host_cache_hit_;
 }
@@ -159,45 +169,61 @@ void BaseManualLoader::copy_weights_to_pinned_host() {
     return;
   }
   CHECK_GT(storage_size_, 0) << "model size must be greater than 0.";
-  CHECK_EQ(weight_slices_.size(), at_host_weight_tensors_.size())
-      << "weight_slices_ size and at_host_weight_tensors_ size mismatch.";
 
   size_t max_alignment = std::max(kHostAlignment, kDeviceAlignment);
   storage_size_ = AlignUp(storage_size_, max_alignment);
+  host_pinned_segments_ = build_host_pinned_segments();
+  CHECK(!host_pinned_segments_.empty())
+      << "Host pinned segments must not be empty";
 
   if (pinned_host_cache_entry_ != nullptr) {
-    host_pinned_storage_ = PinnedHostMemoryCache::get_instance()
-                               .allocate_host_storage(pinned_host_cache_entry_,
-                                                      storage_size_);
+    host_pinned_segments_ = PinnedHostMemoryCache::get_instance()
+                                .allocate_host_storage(pinned_host_cache_entry_,
+                                                       host_pinned_segments_);
   } else {
-    auto ret = aclrtMallocHost(&host_pinned_storage_, storage_size_);
-    CHECK_EQ(ret, ACL_SUCCESS)
-        << "Failed to allocate pinned host storage size=" << storage_size_;
+    for (auto& segment : host_pinned_segments_) {
+      auto ret = aclrtMallocHost(&segment.storage, segment.bytes);
+      CHECK_EQ(ret, ACL_SUCCESS)
+          << "Failed to allocate pinned host segment offset=" << segment.offset
+          << ", size=" << segment.bytes;
+    }
   }
+  refresh_host_pinned_storage_alias();
 
-  for (size_t i = 0; i < weight_slices_.size(); ++i) {
-    const auto& slice = weight_slices_[i];
-    if (!slice.bytes) {
-      continue;
-    }
-    void* dst = static_cast<char*>(host_pinned_storage_) +
-                static_cast<ptrdiff_t>(slice.offset);
-    auto host_tensor = at_host_weight_tensors_[i].to(torch::kCPU).contiguous();
+  if (can_copy_pinned_host_from_device()) {
+    copy_device_storage_to_pinned_host();
+  } else {
+    CHECK_EQ(weight_slices_.size(), at_host_weight_tensors_.size())
+        << "weight_slices_ size and at_host_weight_tensors_ size mismatch.";
 
-    if (is_nz_format_tensor(i)) {
-      int err = copy_host_nd_to_nz(
-          host_tensor, dst, slice.bytes, ACL_MEMCPY_DEVICE_TO_HOST);
-      CHECK_EQ(err, ACL_SUCCESS)
-          << "copy_host_nd_to_nz failed for tensor index " << i;
-    } else {
-      std::memcpy(dst, host_tensor.data_ptr(), slice.bytes);
+    for (size_t i = 0; i < weight_slices_.size(); ++i) {
+      const auto& slice = weight_slices_[i];
+      if (!slice.bytes) {
+        continue;
+      }
+      const auto& segment = find_host_pinned_segment(slice.offset, slice.bytes);
+      void* dst = static_cast<char*>(segment.storage) +
+                  static_cast<ptrdiff_t>(slice.offset - segment.offset);
+      auto host_tensor = at_host_weight_tensors_[i].to(torch::kCPU).contiguous();
+
+      if (is_nz_format_tensor(i)) {
+        int err = copy_host_nd_to_nz(
+            host_tensor, dst, slice.bytes, ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_EQ(err, ACL_SUCCESS)
+            << "copy_host_nd_to_nz failed for tensor index " << i;
+      } else {
+        std::memcpy(dst, host_tensor.data_ptr(), slice.bytes);
+      }
+      at_host_weight_tensors_[i] = torch::zeros({1});
     }
-    at_host_weight_tensors_[i] = torch::zeros({1});
   }
 
   if (pinned_host_cache_entry_ != nullptr) {
     PinnedHostMemoryCache::get_instance().publish(
-        pinned_host_cache_entry_, storage_size_, weight_slices_);
+        pinned_host_cache_entry_,
+        storage_size_,
+        host_pinned_segments_,
+        weight_slices_);
   }
 }
 
@@ -208,16 +234,20 @@ void BaseManualLoader::copy_weights_to_device_async() {
 }
 
 void BaseManualLoader::copy_weights_to_device_async(aclrtStream stream) {
-  void* dst = static_cast<char*>(device_storage_);
-  void* src = static_cast<char*>(host_pinned_storage_);
-
-  auto ret = aclrtMemcpyAsync(dst,
-                              storage_size_,
-                              src,
-                              storage_size_,
-                              ACL_MEMCPY_HOST_TO_DEVICE,
-                              stream);
-  CHECK_EQ(ret, ACL_SUCCESS) << "aclrtMemcpyAsync failed (rolling)";
+  CHECK(!host_pinned_segments_.empty())
+      << "Host pinned segments are not initialized";
+  for (const auto& segment : host_pinned_segments_) {
+    auto ret = aclrtMemcpyAsync(static_cast<char*>(device_storage_) +
+                                    static_cast<ptrdiff_t>(segment.offset),
+                                segment.bytes,
+                                segment.storage,
+                                segment.bytes,
+                                ACL_MEMCPY_HOST_TO_DEVICE,
+                                stream);
+    CHECK_EQ(ret, ACL_SUCCESS)
+        << "aclrtMemcpyAsync failed for host pinned segment offset="
+        << segment.offset << ", size=" << segment.bytes;
+  }
 }
 
 void BaseManualLoader::copy_weights_to_device() {
@@ -306,13 +336,18 @@ void BaseManualLoader::release_host_storage() {
     PinnedHostMemoryCache::get_instance().release(pinned_host_cache_entry_);
     pinned_host_cache_entry_.reset();
     pinned_host_cache_hit_ = false;
+    host_pinned_segments_.clear();
     host_pinned_storage_ = nullptr;
     return;
   }
-  auto ret = aclrtFreeHost(host_pinned_storage_);
-  if (ret != ACL_SUCCESS) {
-    LOG(ERROR) << "Failed to free pinned host storage, ret=" << ret;
+  for (const auto& segment : host_pinned_segments_) {
+    auto ret = aclrtFreeHost(segment.storage);
+    if (ret != ACL_SUCCESS) {
+      LOG(ERROR) << "Failed to free pinned host segment offset="
+                 << segment.offset << ", ret=" << ret;
+    }
   }
+  host_pinned_segments_.clear();
   host_pinned_storage_ = nullptr;
 }
 
@@ -352,6 +387,101 @@ std::string BaseManualLoader::build_pinned_host_cache_key() const {
          std::to_string(parallel_args_.rank()) + "|world_size=" +
          std::to_string(parallel_args_.world_size()) + "|dtype=" +
          torch_dtype_ + "|quant=" + quantize_type_;
+}
+
+bool BaseManualLoader::can_copy_pinned_host_from_device() const {
+  if (rolling_buffer_ != nullptr) {
+    return false;
+  }
+  if (device_storage_ == nullptr || storage_size_ == 0) {
+    return false;
+  }
+  return weight_slices_.size() == weight_count_;
+}
+
+void BaseManualLoader::copy_device_storage_to_pinned_host() {
+  CHECK(can_copy_pinned_host_from_device())
+      << "Device storage is not ready for pinned-host D2H copy";
+  CHECK(!host_pinned_segments_.empty())
+      << "Host pinned segments are not initialized";
+  for (const auto& segment : host_pinned_segments_) {
+    auto ret =
+        aclrtMemcpy(segment.storage,
+                    segment.bytes,
+                    static_cast<char*>(device_storage_) +
+                        static_cast<ptrdiff_t>(segment.offset),
+                    segment.bytes,
+                    ACL_MEMCPY_DEVICE_TO_HOST);
+    CHECK_EQ(ret, ACL_SUCCESS)
+        << "aclrtMemcpy device->pinned_host failed for segment offset="
+        << segment.offset << ", size=" << segment.bytes;
+  }
+}
+
+std::vector<BaseManualLoader::HostPinnedSegment>
+BaseManualLoader::build_host_pinned_segments() const {
+  return {{0, storage_size_, nullptr}};
+}
+
+std::vector<BaseManualLoader::HostPinnedSegment>
+BaseManualLoader::build_balanced_host_pinned_segments(
+    size_t segment_count) const {
+  if (segment_count <= 1 || storage_size_ == 0 || weight_slices_.empty()) {
+    return {{0, storage_size_, nullptr}};
+  }
+  if (segment_count != 2) {
+    LOG(WARNING) << "Balanced host pinned segmentation currently supports only "
+                 << "2 segments, requested=" << segment_count
+                 << ". Falling back to single segment.";
+    return {{0, storage_size_, nullptr}};
+  }
+
+  uint64_t best_boundary = 0;
+  uint64_t best_max_segment_size = std::numeric_limits<uint64_t>::max();
+  for (const auto& slice : weight_slices_) {
+    if (slice.bytes == 0 || slice.offset == 0 || slice.offset >= storage_size_) {
+      continue;
+    }
+    const uint64_t left_size = slice.offset;
+    const uint64_t right_size = storage_size_ - slice.offset;
+    if (left_size == 0 || right_size == 0) {
+      continue;
+    }
+    const uint64_t max_segment_size = std::max(left_size, right_size);
+    if (max_segment_size < best_max_segment_size) {
+      best_max_segment_size = max_segment_size;
+      best_boundary = slice.offset;
+    }
+  }
+
+  if (best_boundary == 0 || best_boundary >= storage_size_) {
+    return {{0, storage_size_, nullptr}};
+  }
+
+  return {{0, best_boundary, nullptr},
+          {best_boundary, storage_size_ - best_boundary, nullptr}};
+}
+
+void BaseManualLoader::refresh_host_pinned_storage_alias() {
+  host_pinned_storage_ =
+      host_pinned_segments_.empty() ? nullptr : host_pinned_segments_.front().storage;
+}
+
+const BaseManualLoader::HostPinnedSegment&
+BaseManualLoader::find_host_pinned_segment(uint64_t offset,
+                                           uint64_t bytes) const {
+  for (const auto& segment : host_pinned_segments_) {
+    const uint64_t segment_end = segment.offset + segment.bytes;
+    const uint64_t slice_end = offset + bytes;
+    if (offset >= segment.offset && slice_end <= segment_end) {
+      CHECK(segment.storage != nullptr)
+          << "Host pinned segment storage is null for offset=" << segment.offset;
+      return segment;
+    }
+  }
+  LOG(FATAL) << "No host pinned segment covers range [offset=" << offset
+             << ", bytes=" << bytes << "]";
+  return host_pinned_segments_.front();
 }
 
 torch::Tensor BaseManualLoader::convert_to_torch_tensor(

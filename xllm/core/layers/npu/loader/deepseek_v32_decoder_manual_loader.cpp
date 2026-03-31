@@ -80,6 +80,11 @@ void DeepseekV32DecoderManualLoader::initialize_tensors(
   initialize_device_expert_list(decode_worldSize_, num_experts_per_partition_);
 }
 
+std::vector<BaseManualLoader::HostPinnedSegment>
+DeepseekV32DecoderManualLoader::build_host_pinned_segments() const {
+  return build_balanced_host_pinned_segments(2);
+}
+
 void DeepseekV32DecoderManualLoader::load_state_dict(
     const StateDict& state_dict) {
   for (const auto& [name, tensor] : state_dict) {

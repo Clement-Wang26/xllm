@@ -67,7 +67,7 @@ namespace xllm {
 // Defines a npu memory alignment constant with 16-byte alignment
 constexpr int32_t NZ_ALIGNMENT = 16;
 // Extra weight pages reserved for mapping/alignment overhead.
-constexpr size_t kXTensorWeightPageSafetyMargin = 20;
+constexpr size_t kXTensorWeightPageSafetyMargin = 1000;
 
 LLMEngine::LLMEngine(const runtime::Options& options,
                      std::shared_ptr<DistManager> dist_manager)
@@ -1236,13 +1236,16 @@ bool LLMEngine::sleep(MasterStatus master_status) {
     return false;
   }
 
-  // Put the model to sleep in PageAllocator
-  // This releases both weight pages and KV cache pages
   const std::string& model_id = options_.model_id();
   auto& page_allocator = PageAllocator::get_instance();
-  if (!page_allocator.sleep_model(model_id)) {
-    LOG(ERROR) << "PageAllocator sleep_model failed, aborting sleep flow";
-    return false;
+
+  if (master_status != MasterStatus::LIGHT_SLEEP) {
+    // Non-LIGHT_SLEEP does not need device weights for D2H host-cache
+    // backfill, so keep the original eager page release order.
+    if (!page_allocator.sleep_model(model_id)) {
+      LOG(ERROR) << "PageAllocator sleep_model failed, aborting sleep flow";
+      return false;
+    }
   }
 
   std::vector<folly::SemiFuture<bool>> futures;
@@ -1257,6 +1260,16 @@ bool LLMEngine::sleep(MasterStatus master_status) {
   for (const auto& result : results) {
     if (!result.value()) {
       LOG(ERROR) << "Sleep failed.";
+      return false;
+    }
+  }
+
+  if (master_status == MasterStatus::LIGHT_SLEEP) {
+    // Let workers materialize host-side cached weights first. This allows
+    // manual loaders to reuse existing device storage via D2H instead of
+    // re-reading checkpoints during LIGHT_SLEEP.
+    if (!page_allocator.sleep_model(model_id)) {
+      LOG(ERROR) << "PageAllocator sleep_model failed, aborting sleep flow";
       return false;
     }
   }

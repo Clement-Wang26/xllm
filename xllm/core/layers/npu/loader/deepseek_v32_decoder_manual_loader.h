@@ -127,6 +127,7 @@ class DeepseekV32DecoderManualLoader : public BaseManualLoader {
   void reserve_experts_weights(int num_of_device_experts);
 
   torch::Tensor trans_rope_weight(torch::Tensor weight);
+  std::vector<HostPinnedSegment> build_host_pinned_segments() const override;
 
   int32_t rank_;
   int32_t first_k_dense_replace_;

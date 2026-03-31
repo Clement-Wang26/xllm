@@ -36,10 +36,17 @@ struct PinnedHostMemoryWeightSlice {
   torch::ScalarType dtype = torch::kFloat16;
 };
 
+struct PinnedHostMemorySegment {
+  uint64_t offset = 0;
+  uint64_t bytes = 0;
+  void* storage = nullptr;
+};
+
 struct PinnedHostMemoryEntry {
   std::string cache_key;
   void* host_pinned_storage = nullptr;
   uint64_t storage_size = 0;
+  std::vector<PinnedHostMemorySegment> host_pinned_segments;
   std::vector<PinnedHostMemoryWeightSlice> weight_slices;
   bool loading = false;
   bool ready = false;
@@ -59,11 +66,13 @@ class PinnedHostMemoryCache {
       const std::string& cache_key,
       bool* cache_hit);
 
-  void* allocate_host_storage(const std::shared_ptr<PinnedHostMemoryEntry>& entry,
-                              uint64_t storage_size);
+  std::vector<PinnedHostMemorySegment> allocate_host_storage(
+      const std::shared_ptr<PinnedHostMemoryEntry>& entry,
+      const std::vector<PinnedHostMemorySegment>& segments);
 
   void publish(const std::shared_ptr<PinnedHostMemoryEntry>& entry,
                uint64_t storage_size,
+               const std::vector<PinnedHostMemorySegment>& host_pinned_segments,
                const std::vector<PinnedHostMemoryWeightSlice>& weight_slices);
 
   void release(const std::shared_ptr<PinnedHostMemoryEntry>& entry);

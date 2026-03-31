@@ -52,39 +52,62 @@ std::shared_ptr<PinnedHostMemoryEntry> PinnedHostMemoryCache::acquire_or_create(
   return entry;
 }
 
-void* PinnedHostMemoryCache::allocate_host_storage(
+std::vector<PinnedHostMemorySegment> PinnedHostMemoryCache::allocate_host_storage(
     const std::shared_ptr<PinnedHostMemoryEntry>& entry,
-    uint64_t storage_size) {
+    const std::vector<PinnedHostMemorySegment>& segments) {
   CHECK(entry != nullptr) << "Pinned host cache entry is null";
-  CHECK_GT(storage_size, 0) << "Pinned host cache storage_size must be > 0";
+  CHECK(!segments.empty())
+      << "Pinned host cache must have at least one host segment";
 
   std::lock_guard<std::mutex> entry_lock(entry->mutex);
-  if (entry->host_pinned_storage == nullptr) {
-    auto ret = aclrtMallocHost(&entry->host_pinned_storage, storage_size);
-    CHECK_EQ(ret, ACL_SUCCESS)
-        << "Failed to allocate cached pinned host storage size="
-        << storage_size;
-    entry->storage_size = storage_size;
+  if (entry->host_pinned_segments.empty()) {
+    entry->host_pinned_segments = segments;
+    for (auto& segment : entry->host_pinned_segments) {
+      CHECK_GT(segment.bytes, 0)
+          << "Pinned host cache segment bytes must be > 0";
+      auto ret = aclrtMallocHost(&segment.storage, segment.bytes);
+      CHECK_EQ(ret, ACL_SUCCESS)
+          << "Failed to allocate cached pinned host segment offset="
+          << segment.offset << ", size=" << segment.bytes;
+    }
+    entry->host_pinned_storage = entry->host_pinned_segments.front().storage;
   } else {
-    CHECK_EQ(entry->storage_size, storage_size)
-        << "Pinned host cache storage_size mismatch, key=" << entry->cache_key
-        << ", cached=" << entry->storage_size
-        << ", requested=" << storage_size;
+    CHECK_EQ(entry->host_pinned_segments.size(), segments.size())
+        << "Pinned host cache segment count mismatch, key=" << entry->cache_key
+        << ", cached=" << entry->host_pinned_segments.size()
+        << ", requested=" << segments.size();
+    for (size_t i = 0; i < segments.size(); ++i) {
+      CHECK_EQ(entry->host_pinned_segments[i].offset, segments[i].offset)
+          << "Pinned host cache segment offset mismatch, key="
+          << entry->cache_key << ", index=" << i;
+      CHECK_EQ(entry->host_pinned_segments[i].bytes, segments[i].bytes)
+          << "Pinned host cache segment size mismatch, key="
+          << entry->cache_key << ", index=" << i;
+      CHECK(entry->host_pinned_segments[i].storage != nullptr)
+          << "Pinned host cache segment storage is null, key="
+          << entry->cache_key << ", index=" << i;
+    }
   }
-  return entry->host_pinned_storage;
+  return entry->host_pinned_segments;
 }
 
 void PinnedHostMemoryCache::publish(
     const std::shared_ptr<PinnedHostMemoryEntry>& entry,
     uint64_t storage_size,
+    const std::vector<PinnedHostMemorySegment>& host_pinned_segments,
     const std::vector<PinnedHostMemoryWeightSlice>& weight_slices) {
   CHECK(entry != nullptr) << "Pinned host cache entry is null";
 
   std::lock_guard<std::mutex> entry_lock(entry->mutex);
-  CHECK(entry->host_pinned_storage != nullptr)
-      << "Pinned host cache entry has no host storage for key="
+  CHECK(!host_pinned_segments.empty())
+      << "Pinned host cache publish needs host segments for key="
+      << entry->cache_key;
+  CHECK_EQ(entry->host_pinned_segments.size(), host_pinned_segments.size())
+      << "Pinned host cache publish segment count mismatch for key="
       << entry->cache_key;
   entry->storage_size = storage_size;
+  entry->host_pinned_storage = host_pinned_segments.front().storage;
+  entry->host_pinned_segments = host_pinned_segments;
   entry->weight_slices = weight_slices;
   entry->ready = true;
   entry->loading = false;
@@ -97,7 +120,7 @@ void PinnedHostMemoryCache::release(
     return;
   }
 
-  void* host_pinned_storage = nullptr;
+  std::vector<void*> host_pinned_segments;
   {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = entries_.find(entry->cache_key);
@@ -115,9 +138,14 @@ void PinnedHostMemoryCache::release(
     if (cached_entry->ref_count == 0 && !cached_entry->loading) {
       {
         std::lock_guard<std::mutex> entry_lock(cached_entry->mutex);
-        host_pinned_storage = cached_entry->host_pinned_storage;
+        for (const auto& segment : cached_entry->host_pinned_segments) {
+          if (segment.storage != nullptr) {
+            host_pinned_segments.push_back(segment.storage);
+          }
+        }
         cached_entry->host_pinned_storage = nullptr;
         cached_entry->storage_size = 0;
+        cached_entry->host_pinned_segments.clear();
         cached_entry->weight_slices.clear();
         cached_entry->ready = false;
       }
@@ -125,10 +153,10 @@ void PinnedHostMemoryCache::release(
     }
   }
 
-  if (host_pinned_storage != nullptr) {
-    auto ret = aclrtFreeHost(host_pinned_storage);
+  for (void* storage : host_pinned_segments) {
+    auto ret = aclrtFreeHost(storage);
     if (ret != ACL_SUCCESS) {
-      LOG(ERROR) << "Failed to free cached pinned host storage, ret=" << ret;
+      LOG(ERROR) << "Failed to free cached pinned host segment, ret=" << ret;
     }
   }
 }

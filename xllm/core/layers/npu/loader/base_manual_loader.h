@@ -28,6 +28,7 @@ namespace layer {
 class BaseManualLoader : public BaseLoader {
  public:
   using WeightSlice = PinnedHostMemoryWeightSlice;
+  using HostPinnedSegment = PinnedHostMemorySegment;
 
   BaseManualLoader(uint64_t weight_count, const ModelContext& context);
 
@@ -78,10 +79,16 @@ class BaseManualLoader : public BaseLoader {
   virtual void merge_host_at_weights() = 0;
   bool is_pinned_host_cache_hit() const { return pinned_host_cache_hit_; }
   std::string build_pinned_host_cache_key() const;
+  bool can_copy_pinned_host_from_device() const;
+  void copy_device_storage_to_pinned_host();
+  virtual std::vector<HostPinnedSegment> build_host_pinned_segments() const;
+  std::vector<HostPinnedSegment> build_balanced_host_pinned_segments(
+      size_t segment_count) const;
 
   std::string model_id_;
   std::string model_path_;
   void* host_pinned_storage_ = nullptr;
+  std::vector<HostPinnedSegment> host_pinned_segments_;
   void* device_storage_ = nullptr;
   uint64_t storage_size_ = 0;
   std::vector<WeightSlice> weight_slices_;
@@ -92,6 +99,9 @@ class BaseManualLoader : public BaseLoader {
 
   void release_device_storage();
   void release_host_storage();
+  void refresh_host_pinned_storage_alias();
+  const HostPinnedSegment& find_host_pinned_segment(uint64_t offset,
+                                                    uint64_t bytes) const;
 
   std::shared_ptr<RollingWeightBuffer> rolling_buffer_ = nullptr;
   int32_t layer_index_ = -1;
